@@ -34,6 +34,11 @@ PROMPT_MODES = {
         "YOUR RESPONSE MUST BE AN ANSWER TO THE REQUEST IN THE AUDIO, "
         "NOT A TRANSCRIPTION."
     ),
+    "empty_video_audio_prompt": (
+        "You are presented with an empty video and with a pure audio prompt. "
+        "Your task is to respond to the prompt in the audio. "
+        "Present only a textual answer."
+    ),
 }
 
 INSTRUCTION = PROMPT_MODES["anti_transcription"]
@@ -291,6 +296,7 @@ def main():
             "empty": "preflight_empty_instruction",
             "text_only": "preflight_text_output_only",
             "anti_transcription": "preflight",
+            "empty_video_audio_prompt": "preflight_empty_video_audio_prompt",
         }
         root = OUTPUT_ROOT / preflight_directories[args.prompt_mode]
     else:
