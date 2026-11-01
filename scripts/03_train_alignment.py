@@ -1744,18 +1744,27 @@ from video4b_stage3 import Video4bAdapter
 def run_video4b_preflight(adapter, args, rows):
     import math
 
-    if args.preflight != 1:
-        raise RuntimeError(
-            "Video4B Stage-3 preflight requires --preflight 1"
-        )
+    if args.method != "sft":
+        raise RuntimeError("This preflight tests Video4B SFT only")
 
-    print("VIDEO4B STAGE-3 PREFLIGHT", flush=True)
-    print(f"Method: {args.method}", flush=True)
-    print("Dataset row: 0 (harmful)", flush=True)
-    print("Using temporary silence-initialised embedding", flush=True)
+    if args.preflight != 1:
+        raise RuntimeError("Use --preflight 1")
+
+    torch.manual_seed(args.seed)
+    torch.cuda.reset_peak_memory_stats()
 
     row = rows[0]
     instruction = sea_audio_instruction(row)
+
+    print("=" * 90, flush=True)
+    print("VIDEO4B REDUCED-PRECISION FULL-FINETUNING DIAGNOSTIC", flush=True)
+    print("Method: SFT", flush=True)
+    print("Precision: checkpoint-selected parameter storage", flush=True)
+    print("Optimizer: Adafactor", flush=True)
+    print(f"Learning rate: {PAPER_LR['sft']}", flush=True)
+    print("Repeated example: harmful row 0", flush=True)
+    print("Optimizer updates: 5", flush=True)
+    print("=" * 90, flush=True)
 
     backend = adapter.backend
     prompt_batch = backend.prompt_batch(instruction)
@@ -1787,12 +1796,61 @@ def run_video4b_preflight(adapter, args, rows):
         flush=True,
     )
 
-    optimizer, parameters = build_optimizer(
-        adapter, args.method
-    )
-    optimizer.zero_grad(set_to_none=True)
+    optimizer, parameters = build_optimizer(adapter, "sft")
 
-    if args.method == "sft":
+    named_trainable = [
+        (name, parameter)
+        for name, parameter in adapter.model.named_parameters()
+        if parameter.requires_grad
+    ]
+
+    print(
+        f"Trainable tensors: {len(named_trainable)}",
+        flush=True,
+    )
+
+    print(
+        f"Trainable parameters: "
+        f"{sum(p.numel() for _, p in named_trainable):,}",
+        flush=True,
+    )
+
+    dtype_counts = {}
+    for _, parameter in named_trainable:
+        name = str(parameter.dtype)
+        dtype_counts[name] = (
+            dtype_counts.get(name, 0) + parameter.numel()
+        )
+
+    print(
+        f"Trainable parameter dtypes: {dtype_counts}",
+        flush=True,
+    )
+
+    actual_dtypes = {
+        parameter.dtype
+        for _, parameter in named_trainable
+    }
+
+    if not actual_dtypes.issubset({
+        torch.float16,
+        torch.bfloat16,
+    }):
+        raise RuntimeError(
+            f"Unexpected trainable parameter dtypes: {actual_dtypes}"
+        )
+
+    print(
+        f"Actual training precision: {actual_dtypes}",
+        flush=True,
+    )
+
+    losses = []
+    changed_total = 0
+
+    for step in range(1, 6):
+        optimizer.zero_grad(set_to_none=True)
+
         output, batch = forward_target(
             adapter,
             instruction,
@@ -1800,89 +1858,134 @@ def run_video4b_preflight(adapter, args, rows):
             embedding,
             True,
         )
+
         loss = output.loss
-        if loss is None:
-            raise RuntimeError("SFT returned no loss")
-        print(
-            f"SFT loss: {float(loss.detach()):.6f}",
-            flush=True,
-        )
-    else:
-        with torch.no_grad():
-            ref_chosen, _ = target_logprob(
-                adapter, instruction,
-                row["new_chosen_response"],
-                embedding, True,
-            )
-            ref_rejected, _ = target_logprob(
-                adapter, instruction,
-                row["rejected_response"],
-                embedding, True,
+
+        if loss is None or not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Invalid SFT loss at step {step}"
             )
 
-        chosen, _ = target_logprob(
-            adapter, instruction,
+        loss_value = float(loss.detach().float().cpu())
+        losses.append(loss_value)
+
+        del output
+        del batch
+
+        loss.backward()
+
+        grad_norm, grad_tensors = global_grad_norm(
+            parameters
+        )
+
+        if (
+            not math.isfinite(grad_norm)
+            or grad_norm <= 0
+            or grad_tensors == 0
+        ):
+            raise RuntimeError(
+                f"Invalid gradients at step {step}: "
+                f"norm={grad_norm}, tensors={grad_tensors}"
+            )
+
+        snapshots = sampled_parameter_snapshot(
+            named_trainable,
+            samples_per_tensor=32,
+        )
+
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        changes = compare_parameter_snapshot(snapshots)
+        changed_total += changes["changed_values"]
+
+        state = optimizer_state_summary(optimizer)
+
+        print()
+        print(
+            f"STEP {step}/5",
+            flush=True,
+        )
+        print(
+            f"  loss:                  {loss_value:.8f}",
+            flush=True,
+        )
+        print(
+            f"  gradient norm:         {grad_norm:.8f}",
+            flush=True,
+        )
+        print(
+            f"  gradient tensors:      {grad_tensors}",
+            flush=True,
+        )
+        print(
+            f"  changed tensors:       "
+            f"{changes['changed_tensors']}/"
+            f"{changes['sampled_tensors']}",
+            flush=True,
+        )
+        print(
+            f"  changed sampled values:"
+            f" {changes['changed_values']}/"
+            f"{changes['sampled_values']}",
+            flush=True,
+        )
+        print(
+            f"  maximum weight delta:  "
+            f"{changes['max_abs_delta']:.9e}",
+            flush=True,
+        )
+        print(
+            f"  changed examples:      "
+            f"{changes['changed_examples'][:5]}",
+            flush=True,
+        )
+        print(
+            f"  Adafactor step:        "
+            f"{state['max_step']}",
+            flush=True,
+        )
+        print(
+            f"  allocated GPU memory:  "
+            f"{torch.cuda.memory_allocated() / 1024**3:.2f} GiB",
+            flush=True,
+        )
+
+        del snapshots
+        del loss
+        optimizer.zero_grad(set_to_none=True)
+
+    with torch.no_grad():
+        output, batch = forward_target(
+            adapter,
+            instruction,
             row["new_chosen_response"],
-            embedding, True,
-        )
-        rejected, _ = target_logprob(
-            adapter, instruction,
-            row["rejected_response"],
-            embedding, True,
+            embedding,
+            True,
         )
 
-        advantage = (
-            chosen - rejected
-            - ref_chosen.detach()
-            + ref_rejected.detach()
+        final_loss = float(
+            output.loss.detach().float().cpu()
         )
 
-        loss = -torch.nn.functional.logsigmoid(
-            args.beta * advantage
-        )
-
-        print(
-            f"Reference margin: "
-            f"{float(ref_chosen - ref_rejected):.6f}",
-            flush=True,
-        )
-        print(
-            f"DPO loss: {float(loss.detach()):.6f}",
-            flush=True,
-        )
-
-    if not torch.isfinite(loss):
-        raise RuntimeError("Non-finite preflight loss")
-
-    loss.backward()
-
-    grad_norm, grad_tensors = global_grad_norm(parameters)
-
+    print()
+    print("=" * 90, flush=True)
+    print("SFT DIAGNOSTIC SUMMARY", flush=True)
     print(
-        f"Gradient norm: {grad_norm:.8f}, "
-        f"gradient tensors: {grad_tensors}",
-        flush=True,
-    )
-
-    if not math.isfinite(grad_norm) or grad_norm <= 0:
-        raise RuntimeError("No valid training gradients")
-
-    probe_name, probe = choose_probe_parameter(
-        adapter.model
-    )
-    before = probe_snapshot(probe)
-
-    optimizer.step()
-    torch.cuda.synchronize()
-
-    delta = probe_delta(probe, before)
-
-    print(
-        f"Probe parameter: {probe_name}",
+        f"Initial loss: {losses[0]:.8f}",
         flush=True,
     )
     print(
-        f"Parameter update norm: {delta:.8e}",
+        f"Final loss:   {final_loss:.8f}",
+        flush=True,
+    )
+    print(
+        f"Loss change:  {final_loss - losses[0]:+.8f}",
+        flush=True,
+    )
+    print(
+        f"Sampled stored-value changes across 5 steps: "
+        f"{changed_total}",
         flush=True,
     )
     print(
@@ -1891,16 +1994,40 @@ def run_video4b_preflight(adapter, args, rows):
         flush=True,
     )
 
-    if delta <= 0:
+    weights_changed = changed_total > 0
+    loss_decreased = final_loss < losses[0]
+
+    print(
+        f"Actual stored parameter updates detected: {weights_changed}",
+        flush=True,
+    )
+    print(
+        f"Repeated-example loss decreased: {loss_decreased}",
+        flush=True,
+    )
+    print(
+        "No model checkpoint or embedding file saved.",
+        flush=True,
+    )
+    print("=" * 90, flush=True)
+
+    if not weights_changed:
         raise RuntimeError(
-            "Optimiser did not change the probe parameter"
+            "No sampled parameter changes detected "
+            "across five Adafactor updates"
+        )
+
+    if not loss_decreased:
+        raise RuntimeError(
+            "Stored parameters changed, but repeated-example "
+            "SFT loss did not decrease"
         )
 
     print(
-        "PREFLIGHT PASSED — model and temporary embedding "
-        "discarded on process exit",
+        "VIDEO4B SFT PREFLIGHT PASSED",
         flush=True,
     )
+
 
 
 def load_embedding(
