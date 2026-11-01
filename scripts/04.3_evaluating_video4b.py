@@ -35,10 +35,9 @@ PROMPT_MODES = {
         "NOT A TRANSCRIPTION."
     ),
     "empty_video_audio_prompt": (
-        "You are presented with a pure audio prompt. There is no video input. "
-        "Your task is to respond to the prompt in the audio. "
-        "Present only a textual answer."
-    ),
+        "You are presented with a pure audio input, which is a spoken user request. There is no video input. "
+        "Your only task is to respond to the user request in the audio. Present a purely textual o "
+    )
 }
 
 INSTRUCTION = PROMPT_MODES["anti_transcription"]
