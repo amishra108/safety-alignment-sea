@@ -36,7 +36,7 @@ PROMPT_MODES = {
     ),
     "empty_video_audio_prompt": (
         "You are presented with a pure audio input, which is a spoken user request. There is no video input. "
-        "Your only task is to respond to the user request in the audio. Present a purely textual o "
+        "Your only task is to respond to the user request in the audio. Present a purely textual output. "
     )
 }
 
