@@ -8,6 +8,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -15,7 +16,7 @@ ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment-sea")
 BENCHMARK_ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment")
 MANIFEST = BENCHMARK_ROOT / "data/audio_jailbreak_clean_benchmark/manifests/benchmark.csv"
 MODEL_PATH = ROOT / "models/video_salmonn2_pro_4b"
-OUTPUT_ROOT = ROOT / "outputs/04.3_evaluating_video4b/video4b_base"
+OUTPUT_ROOT = ROOT / "outputs/04.3_evaluating_video4b"
 STAGE2_PATH = ROOT / "scripts/02_optimise_embedding.py"
 
 MAX_NEW_TOKENS = 1024
@@ -47,6 +48,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--machine", choices=("nete", "air211", "air213"), required=True)
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument("--model-label", type=str)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-id", type=int, default=0)
     parser.add_argument(
@@ -58,6 +61,20 @@ def parse_args():
     parser.add_argument("--preflight-empty", action="store_true")
     parser.add_argument("--merge-only", action="store_true")
     args = parser.parse_args()
+
+    args.model_path = args.model_path.resolve()
+    if not args.model_path.is_dir():
+        parser.error(f"Model checkpoint does not exist: {args.model_path}")
+
+    if args.model_label is None:
+        args.model_label = (
+            "video4b_base"
+            if args.model_path == MODEL_PATH.resolve()
+            else args.model_path.name
+        )
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.model_label):
+        parser.error("--model-label must be a safe directory name")
 
     if args.gpu < 0:
         parser.error("--gpu must be nonnegative")
@@ -132,11 +149,11 @@ def atomic_json(path, value):
         os.fsync(handle.fileno())
 
 
-def load_adapter(device):
+def load_adapter(device, model_path):
     spec = importlib.util.spec_from_file_location("video4b_stage2", STAGE2_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    adapter = module.Video4bAdapter(MODEL_PATH, device, silence_seconds=1.0)
+    adapter = module.Video4bAdapter(model_path, device, silence_seconds=1.0)
     adapter.model.eval()
     return adapter
 
@@ -194,17 +211,20 @@ def generate(adapter, row):
     return response, duration
 
 
-def make_record(row, response, duration):
+def make_record(row, response, duration, args):
     return {
         "task_id": row["example_id"] + "__audio",
         "benchmark": "Audio Jailbreak Clean Benchmark",
-        "model": "video4b_base",
-        "model_variant": "base",
+        "model": args.model_label,
+        "model_variant": (
+            "base" if args.model_path == MODEL_PATH.resolve()
+            else args.model_label
+        ),
         "prompt_mode": next(
             mode for mode, instruction in PROMPT_MODES.items()
             if instruction == INSTRUCTION
         ),
-        "model_path": str(MODEL_PATH.resolve()),
+        "model_path": str(args.model_path),
         "host": socket.gethostname().split(".")[0],
         "example_id": row["example_id"],
         "english_example_id": row["english_example_id"],
@@ -290,6 +310,7 @@ def main():
         raise RuntimeError(f"Running on {host}, expected {args.machine}")
 
     rows = read_manifest()
+    model_root = OUTPUT_ROOT / args.model_label
     if args.preflight:
         preflight_directories = {
             "empty": "preflight_empty_instruction",
@@ -297,15 +318,15 @@ def main():
             "anti_transcription": "preflight",
             "empty_video_audio_prompt": "preflight_empty_video_audio_prompt",
         }
-        root = OUTPUT_ROOT / preflight_directories[args.prompt_mode]
+        root = model_root / preflight_directories[args.prompt_mode]
     else:
-        root = OUTPUT_ROOT / args.prompt_mode
+        root = model_root / args.prompt_mode
     root.mkdir(parents=True, exist_ok=True)
 
     manifest_hash = hashlib.sha256(MANIFEST.read_bytes()).hexdigest()
     config = {
-        "model": "video4b_base",
-        "model_path": str(MODEL_PATH.resolve()),
+        "model": args.model_label,
+        "model_path": str(args.model_path),
         "manifest": str(MANIFEST.resolve()),
         "manifest_sha256": manifest_hash,
         "num_shards": args.num_shards,
@@ -387,14 +408,20 @@ def main():
             key = record["example_id"]
             if key not in allowed or key in completed:
                 raise RuntimeError(f"Invalid or duplicate existing record: {key}")
-            if record["model"] != "video4b_base":
+            if record["model"] != args.model_label:
                 raise RuntimeError(f"Unexpected model in existing record: {key}")
+            if record["model_path"] != str(args.model_path):
+                raise RuntimeError(f"Checkpoint mismatch in existing record: {key}")
+            if record["prompt_mode"] != args.prompt_mode:
+                raise RuntimeError(f"Prompt mode mismatch in existing record: {key}")
             completed.add(key)
 
         pending = [row for row in assigned if row["example_id"] not in completed]
 
         print("=" * 88, flush=True)
         print("VIDEO4B REAL-AUDIO EVALUATION", flush=True)
+        print(f"Model label: {args.model_label}", flush=True)
+        print(f"Model checkpoint: {args.model_path}", flush=True)
         print(f"Prompt mode: {args.prompt_mode}", flush=True)
         print(f"Instruction: {INSTRUCTION!r}", flush=True)
         print(f"Host: {host} | GPU: {args.gpu}", flush=True)
@@ -413,7 +440,7 @@ def main():
 
             torch.cuda.set_device(args.gpu)
             device = torch.device(f"cuda:{args.gpu}")
-            adapter = load_adapter(device)
+            adapter = load_adapter(device, args.model_path)
 
             for index, row in enumerate(pending, start=1):
                 print(
@@ -424,7 +451,7 @@ def main():
                 )
 
                 response, duration = generate(adapter, row)
-                record = make_record(row, response, duration)
+                record = make_record(row, response, duration, args)
 
                 with output.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
