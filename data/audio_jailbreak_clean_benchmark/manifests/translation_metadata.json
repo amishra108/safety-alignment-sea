@@ -1,0 +1,25 @@
+{
+  "source": "data/audio_jailbreaks/manifests/semantic.csv",
+  "languages": [
+    "english",
+    "spanish",
+    "chinese",
+    "russian"
+  ],
+  "rows_per_language": 800,
+  "total_rows": 3200,
+  "conditions": {
+    "original": 200,
+    "literal": 200,
+    "narrative_framing": 200,
+    "content_dilution": 200
+  },
+  "split_per_language": {
+    "harmful": 400,
+    "benign": 400
+  },
+  "translation_model": "Qwen3.6-35B-A3B",
+  "translation_temperature": 0,
+  "translation_batch_size": 16,
+  "translation_strategy": "translate each already-generated English semantic prompt; do not regenerate semantic attacks in target language"
+}

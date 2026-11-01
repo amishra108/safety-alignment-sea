@@ -1,0 +1,3 @@
+Directory: video4b_trained
+Purpose: Video-SALMONN-2 (4B) evaluation model and SEA-trained checkpoints.
+Pretrained weights and trained checkpoints are stored locally and excluded from GitHub.

@@ -1,0 +1,14 @@
+{
+  "total_rows": 3200,
+  "languages": {
+    "english": 800,
+    "spanish": 800,
+    "chinese": 800,
+    "russian": 800
+  },
+  "english_audio": "hard-linked from existing Audio Jailbreak semantic WAVs where filesystem permits; copy fallback otherwise",
+  "translated_audio_rows": 2400,
+  "tts_model": "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "translated_tts_batch_size": 32,
+  "tts_style": "same neutral middle-aged male normal-speed template with target language substituted"
+}

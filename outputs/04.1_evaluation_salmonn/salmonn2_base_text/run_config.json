@@ -1,0 +1,13 @@
+{
+  "model": "salmonn2_base",
+  "model_variant": "base",
+  "model_path": "/research/milsrg1/user_workspace/am3244/safety-alignment/models/salmonn2",
+  "manifest": "/research/milsrg1/user_workspace/am3244/safety-alignment/data/audio_jailbreak_clean_benchmark/manifests/benchmark.csv",
+  "modality": "text",
+  "num_shards": 4,
+  "max_new_tokens": 1024,
+  "generation_decoding": "greedy",
+  "enable_thinking": false,
+  "target_system_prompt": null,
+  "target_extra_instruction": null
+}

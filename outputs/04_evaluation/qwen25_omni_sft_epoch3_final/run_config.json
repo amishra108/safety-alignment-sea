@@ -1,0 +1,13 @@
+{
+  "model": "qwen25_omni",
+  "model_path": "/research/milsrg1/user_workspace/am3244/safety-alignment-sea/models/qwen2.5-omni-7b_sea_trained_sft_epoch3_final",
+  "checkpoint_architecture": "full_omni",
+  "reconstruction_base_model": null,
+  "manifest": "/research/milsrg1/user_workspace/am3244/safety-alignment/data/audio_jailbreak_clean_benchmark/manifests/benchmark.csv",
+  "modality": "audio",
+  "num_shards": 4,
+  "max_new_tokens": 1024,
+  "generation_decoding": "greedy",
+  "target_system_prompt": null,
+  "target_extra_instruction": null
+}

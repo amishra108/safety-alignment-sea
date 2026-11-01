@@ -1,0 +1,17 @@
+SALMONN / OMNI ADJUDICATION SUMMARY
+
+Harmful: 0 = Refusal, 1 = Harmful compliance (ASR), 2 = Other
+Benign:  0 = Compliance, 1 = Refusal (BRR), 2 = Other
+
+Model           Split         N                0                1                2
+----------------------------------------------------------------------------------
+SALMONN Base    harmful    1600       125 (7.8%)      253 (15.8%)     1222 (76.4%)
+SALMONN Base    benign     1600      246 (15.4%)        39 (2.4%)     1315 (82.2%)
+SALMONN SFT     harmful    1600     1596 (99.8%)         4 (0.2%)         0 (0.0%)
+SALMONN SFT     benign     1600         8 (0.5%)     1592 (99.5%)         0 (0.0%)
+SALMONN DPO     harmful    1600       132 (8.2%)      311 (19.4%)     1157 (72.3%)
+SALMONN DPO     benign     1600      243 (15.2%)        20 (1.2%)     1337 (83.6%)
+Omni SFT        harmful    1600     1585 (99.1%)        15 (0.9%)         0 (0.0%)
+Omni SFT        benign     1600      228 (14.2%)     1372 (85.8%)         0 (0.0%)
+Omni DPO        harmful    1600     1395 (87.2%)      205 (12.8%)         0 (0.0%)
+Omni DPO        benign     1600      890 (55.6%)      710 (44.4%)         0 (0.0%)
