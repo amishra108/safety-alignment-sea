@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-id", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--preflight", action="store_true")
     return parser.parse_args()
 
@@ -128,11 +129,21 @@ def load_completed(manifest_path):
 
     with manifest_path.open("r", encoding="utf-8") as handle:
         for line in handle:
-            line = line.strip()
-            if not line:
+            if not line.strip():
                 continue
+
             record = json.loads(line)
-            completed.add(int(record["row_index"]))
+            audio_path = ROOT / record["gm_audio_path"]
+
+            if not audio_path.is_file():
+                continue
+
+            try:
+                info = sf.info(audio_path)
+                if info.frames > 0 and info.samplerate > 0:
+                    completed.add(int(record["row_index"]))
+            except (OSError, RuntimeError, ValueError):
+                continue
 
     return completed
 
@@ -146,6 +157,9 @@ def append_manifest(path, record):
 
 def main():
     args = parse_args()
+
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
 
     if args.num_shards < 1:
         raise ValueError("--num-shards must be >= 1")
@@ -212,6 +226,7 @@ def main():
     print(f"Completed:   {len(completed)}")
     print(f"Pending:     {len(pending)}")
     print(f"Preflight:   {args.preflight}")
+    print(f"Batch size:  {args.batch_size}")
     print(f"Model:       {args.model}")
     print(f"Output:      {run_root}")
 
@@ -225,56 +240,84 @@ def main():
         str(args.model),
         device_map="cuda:0",
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
 
-    for position, (row_index, row) in enumerate(pending, start=1):
-        spoken_text = gm_audio_text(row)
-        training_prompt = gm_training_prompt(row)
-        chosen_response, rejected_response = training_targets(row)
+    for batch_start in range(0, len(pending), args.batch_size):
+        batch = pending[batch_start:batch_start + args.batch_size]
 
-        audio_path = audio_dir / f"row_{row_index:04d}.wav"
+        texts = [gm_audio_text(row) for _, row in batch]
+        languages = ["English"] * len(batch)
+        instructions = [VOICE_INSTRUCTION] * len(batch)
 
-        print()
         print(
-            f"[{position}/{len(pending)}] "
-            f"row={row_index:04d} "
-            f"category={row['category']}"
-        )
-        print(f"TTS text: {spoken_text}")
-
-        wavs, sample_rate = model.generate_voice_design(
-            text=spoken_text,
-            language="English",
-            instruct=VOICE_INSTRUCTION,
+            f"[batch {batch_start // args.batch_size + 1}/"
+            f"{(len(pending) + args.batch_size - 1) // args.batch_size}] "
+            f"size={len(batch)} first_row={batch[0][0]}",
+            flush=True,
         )
 
-        sf.write(
-            audio_path,
-            wavs[0],
-            sample_rate,
-            subtype="PCM_16",
-        )
+        with torch.inference_mode():
+            wavs, sample_rate = model.generate_voice_design(
+                text=texts,
+                language=languages,
+                instruct=instructions,
+            )
 
-        record = {
-            "row_index": row_index,
-            "source_index": row.get("source_index"),
-            "category": row["category"],
-            "phrase_type": row.get("phrase_type"),
-            "gm_audio_text": spoken_text,
-            "gm_training_prompt": training_prompt,
-            "gm_audio_path": relative_to_root(audio_path),
-            "sample_rate": sample_rate,
-            "chosen_response": chosen_response,
-            "rejected_response": rejected_response,
-            "tts_model": relative_to_root(args.model),
-            "tts_language": "English",
-            "tts_voice_instruction": VOICE_INSTRUCTION,
-        }
+        if len(wavs) != len(batch):
+            raise RuntimeError(
+                f"TTS returned {len(wavs)} WAVs for {len(batch)} inputs"
+            )
 
-        append_manifest(manifest_path, record)
+        for (row_index, row), spoken_text, wav in zip(
+            batch, texts, wavs
+        ):
+            training_prompt = gm_training_prompt(row)
+            chosen_response, rejected_response = training_targets(row)
 
-        print(f"Saved: {audio_path}")
+            audio_path = audio_dir / f"row_{row_index:04d}.wav"
+            temporary_path = audio_dir / f"row_{row_index:04d}.wav.tmp"
+
+            sf.write(
+                temporary_path,
+                wav,
+                sample_rate,
+                format="WAV",
+                subtype="PCM_16",
+            )
+
+            info = sf.info(temporary_path)
+            if info.frames <= 0 or info.samplerate <= 0:
+                raise RuntimeError(f"Invalid WAV: {temporary_path}")
+
+            temporary_path.replace(audio_path)
+
+            record = {
+                "row_index": row_index,
+                "source_index": row.get("source_index"),
+                "category": row["category"],
+                "phrase_type": row.get("phrase_type"),
+                "gm_audio_text": spoken_text,
+                "gm_training_prompt": training_prompt,
+                "gm_audio_path": relative_to_root(audio_path),
+                "sample_rate": sample_rate,
+                "duration_seconds": info.duration,
+                "chosen_response": chosen_response,
+                "rejected_response": rejected_response,
+                "tts_model": relative_to_root(args.model),
+                "tts_language": "English",
+                "tts_voice_instruction": VOICE_INSTRUCTION,
+                "tts_batch_size": len(batch),
+            }
+
+            append_manifest(manifest_path, record)
+
+            print(
+                f"[saved] row={row_index:04d} "
+                f"duration={info.duration:.2f}s "
+                f"path={audio_path}",
+                flush=True,
+            )
 
     print()
     print("GM audio preparation complete.")
