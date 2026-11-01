@@ -15,10 +15,23 @@ DEFAULT_INPUT = ROOT / "data" / "saferlhf" / "sea_3000_prepared.jsonl"
 DEFAULT_OUTPUT = ROOT / "data" / "rlhf_tts_audio"
 DEFAULT_MODEL = ROOT / "models" / "qwen3-tts-12hz-1.7b-voicedesign"
 
-VOICE_INSTRUCTION = (
-    "A clear adult English-speaking voice with a neutral mood, "
-    "natural delivery, and normal speaking rate."
+DEFAULT_HARMLESS_STYLE = (
+    "The speaker is male, speaks English, and conveys a neutral mood"
 )
+
+
+def voice_instruction(row):
+    instruction = row.get("audio_style_control_target")
+
+    if instruction:
+        return instruction
+
+    if row.get("category") == "harmless":
+        return DEFAULT_HARMLESS_STYLE
+
+    raise ValueError(
+        "Harmful row is missing audio_style_control_target"
+    )
 
 
 def parse_args():
@@ -248,7 +261,7 @@ def main():
 
         texts = [gm_audio_text(row) for _, row in batch]
         languages = ["English"] * len(batch)
-        instructions = [VOICE_INSTRUCTION] * len(batch)
+        instructions = [voice_instruction(row) for _, row in batch]
 
         print(
             f"[batch {batch_start // args.batch_size + 1}/"
@@ -306,7 +319,10 @@ def main():
                 "rejected_response": rejected_response,
                 "tts_model": relative_to_root(args.model),
                 "tts_language": "English",
-                "tts_voice_instruction": VOICE_INSTRUCTION,
+                "audio_style_control_target": row.get(
+                    "audio_style_control_target"
+                ),
+                "tts_voice_instruction": voice_instruction(row),
                 "tts_batch_size": len(batch),
             }
 
