@@ -1753,18 +1753,26 @@ from video4b_stage3 import Video4bAdapter
 def run_video4b_preflight(adapter, args, rows):
     import math
 
-    if args.preflight != 1:
-        raise RuntimeError(
-            "Video4B Stage-3 preflight requires --preflight 1"
-        )
+    if args.method != "dpo":
+        raise RuntimeError("Video4B preflight requires DPO")
 
-    print("VIDEO4B STAGE-3 PREFLIGHT", flush=True)
-    print(f"Method: {args.method}", flush=True)
-    print("Dataset row: 0 (harmful)", flush=True)
-    print("Using temporary silence-initialised embedding", flush=True)
+    if args.preflight != 1:
+        raise RuntimeError("Use --preflight 1")
+
+    torch.manual_seed(args.seed)
+    torch.cuda.reset_peak_memory_stats()
 
     row = rows[0]
     instruction = sea_audio_instruction(row)
+
+    print("=" * 90, flush=True)
+    print("VIDEO4B BF16 FULL-FINETUNING DPO PREFLIGHT", flush=True)
+    print("Optimizer: Adafactor", flush=True)
+    print("Learning rate: 1e-5", flush=True)
+    print(f"DPO beta: {args.beta}", flush=True)
+    print("Repeated example: harmful row 0", flush=True)
+    print("Updates: 5", flush=True)
+    print("=" * 90, flush=True)
 
     backend = adapter.backend
     prompt_batch = backend.prompt_batch(instruction)
@@ -1774,10 +1782,7 @@ def run_video4b_preflight(adapter, args, rows):
     ) as captured:
         with torch.no_grad():
             adapter.model.eval()
-            adapter.model(
-                **prompt_batch,
-                use_cache=False,
-            )
+            adapter.model(**prompt_batch, use_cache=False)
 
     if len(captured) != 1:
         raise RuntimeError(
@@ -1791,125 +1796,295 @@ def run_video4b_preflight(adapter, args, rows):
             f"Unexpected embedding shape: {tuple(embedding.shape)}"
         )
 
+    print(f"Embedding shape: {tuple(embedding.shape)}", flush=True)
+
+    named_trainable = [
+        (name, parameter)
+        for name, parameter in adapter.model.named_parameters()
+        if parameter.requires_grad
+    ]
+
+    parameter_dtypes = {
+        parameter.dtype
+        for _, parameter in named_trainable
+    }
+
+    if parameter_dtypes != {torch.bfloat16}:
+        raise RuntimeError(
+            f"Unexpected Video4B training precision: "
+            f"{parameter_dtypes}"
+        )
+
     print(
-        f"Synthetic embedding shape: {tuple(embedding.shape)}",
+        f"Trainable parameters: "
+        f"{sum(p.numel() for _, p in named_trainable):,}",
         flush=True,
     )
 
-    optimizer, parameters = build_optimizer(
-        adapter, args.method
+    print(
+        "Trainable dtype: torch.bfloat16",
+        flush=True,
     )
-    optimizer.zero_grad(set_to_none=True)
 
-    if args.method == "sft":
-        output, batch = forward_target(
+    # Fixed base-model DPO reference
+    adapter.model.eval()
+
+    with torch.no_grad():
+        ref_chosen, _ = target_logprob(
             adapter,
             instruction,
             row["new_chosen_response"],
             embedding,
             True,
         )
-        loss = output.loss
-        if loss is None:
-            raise RuntimeError("SFT returned no loss")
-        print(
-            f"SFT loss: {float(loss.detach()):.6f}",
-            flush=True,
-        )
-    else:
-        with torch.no_grad():
-            ref_chosen, _ = target_logprob(
-                adapter, instruction,
-                row["new_chosen_response"],
-                embedding, True,
-            )
-            ref_rejected, _ = target_logprob(
-                adapter, instruction,
-                row["rejected_response"],
-                embedding, True,
-            )
 
-        chosen, _ = target_logprob(
-            adapter, instruction,
-            row["new_chosen_response"],
-            embedding, True,
-        )
-        rejected, _ = target_logprob(
-            adapter, instruction,
+        ref_rejected, _ = target_logprob(
+            adapter,
+            instruction,
             row["rejected_response"],
-            embedding, True,
+            embedding,
+            True,
         )
 
-        advantage = (
-            chosen - rejected
-            - ref_chosen.detach()
-            + ref_rejected.detach()
+    ref_chosen = float(ref_chosen.detach().cpu())
+    ref_rejected = float(ref_rejected.detach().cpu())
+    reference_margin = ref_chosen - ref_rejected
+
+    print(
+        f"Fixed reference chosen logp: {ref_chosen:.6f}",
+        flush=True,
+    )
+    print(
+        f"Fixed reference rejected logp: {ref_rejected:.6f}",
+        flush=True,
+    )
+    print(
+        f"Fixed reference margin: {reference_margin:.6f}",
+        flush=True,
+    )
+
+    optimizer, parameters = build_optimizer(adapter, "dpo")
+
+    actual_lr = float(optimizer.param_groups[0]["lr"])
+
+    if actual_lr != 1e-5:
+        raise RuntimeError(
+            f"Expected Video4B DPO LR=1e-5, got {actual_lr}"
         )
 
-        loss = -torch.nn.functional.logsigmoid(
-            args.beta * advantage
+    def evaluate_policy():
+        with torch.no_grad():
+            chosen, _ = target_logprob(
+                adapter,
+                instruction,
+                row["new_chosen_response"],
+                embedding,
+                True,
+            )
+
+            rejected, _ = target_logprob(
+                adapter,
+                instruction,
+                row["rejected_response"],
+                embedding,
+                True,
+            )
+
+        chosen_value = float(chosen.detach().cpu())
+        rejected_value = float(rejected.detach().cpu())
+        margin = chosen_value - rejected_value
+        advantage = margin - reference_margin
+        z = args.beta * advantage
+
+        loss = float(
+            -F.logsigmoid(
+                torch.tensor(z, dtype=torch.float64)
+            ).item()
         )
 
+        return loss, margin, advantage
+
+    losses = []
+    changed_values_total = 0
+    initial_loss, initial_margin, initial_advantage = (
+        evaluate_policy()
+    )
+
+    print(
+        f"Initial DPO loss: {initial_loss:.8f}",
+        flush=True,
+    )
+
+    for step in range(1, 6):
+        optimizer.zero_grad(set_to_none=True)
+        adapter.model.eval()
+
+        # The detached margin determines the exact DPO derivatives.
+        current_loss, policy_margin, advantage = (
+            evaluate_policy()
+        )
+
+        z = args.beta * advantage
+        sigmoid_negative_z = math.exp(
+            -F.softplus(
+                torch.tensor(z, dtype=torch.float64)
+            ).item()
+        )
+        gradient_scale = args.beta * sigmoid_negative_z
+
+        # Separate response graphs to reduce peak GPU memory.
+        chosen_logp, _ = target_logprob(
+            adapter,
+            instruction,
+            row["new_chosen_response"],
+            embedding,
+            True,
+        )
+
+        (-gradient_scale * chosen_logp).backward()
+        del chosen_logp
+
+        rejected_logp, _ = target_logprob(
+            adapter,
+            instruction,
+            row["rejected_response"],
+            embedding,
+            True,
+        )
+
+        (gradient_scale * rejected_logp).backward()
+        del rejected_logp
+
+        grad_norm, grad_tensors = global_grad_norm(
+            parameters
+        )
+
+        if (
+            not math.isfinite(grad_norm)
+            or grad_norm <= 0
+            or grad_tensors <= 0
+        ):
+            raise RuntimeError(
+                f"Invalid DPO gradients at step {step}: "
+                f"norm={grad_norm}, tensors={grad_tensors}"
+            )
+
+        snapshots = sampled_parameter_snapshot(
+            named_trainable,
+            samples_per_tensor=32,
+        )
+
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        changes = compare_parameter_snapshot(snapshots)
+        changed_values_total += changes["changed_values"]
+
+        state = optimizer_state_summary(optimizer)
+
+        print()
+        print(f"STEP {step}/5", flush=True)
+        print(f"  DPO loss:              {current_loss:.8f}", flush=True)
+        print(f"  Policy margin:         {policy_margin:.6f}", flush=True)
+        print(f"  Reference margin:      {reference_margin:.6f}", flush=True)
+        print(f"  DPO advantage:         {advantage:.6f}", flush=True)
+        print(f"  Gradient norm:         {grad_norm:.8f}", flush=True)
+        print(f"  Gradient tensors:      {grad_tensors}", flush=True)
         print(
-            f"Reference margin: "
-            f"{float(ref_chosen - ref_rejected):.6f}",
+            f"  Changed tensors:       "
+            f"{changes['changed_tensors']}/"
+            f"{changes['sampled_tensors']}",
             flush=True,
         )
         print(
-            f"DPO loss: {float(loss.detach()):.6f}",
+            f"  Changed sampled values: "
+            f"{changes['changed_values']}/"
+            f"{changes['sampled_values']}",
+            flush=True,
+        )
+        print(
+            f"  Maximum weight delta:  "
+            f"{changes['max_abs_delta']:.9e}",
+            flush=True,
+        )
+        print(
+            f"  Changed examples:      "
+            f"{changes['changed_examples'][:5]}",
+            flush=True,
+        )
+        print(
+            f"  Adafactor step:        {state['max_step']}",
+            flush=True,
+        )
+        print(
+            f"  GPU allocated:         "
+            f"{torch.cuda.memory_allocated() / 1024**3:.2f} GiB",
             flush=True,
         )
 
-    if not torch.isfinite(loss):
-        raise RuntimeError("Non-finite preflight loss")
+        losses.append(current_loss)
+        del snapshots
 
-    loss.backward()
+        optimizer.zero_grad(set_to_none=True)
 
-    grad_norm, grad_tensors = global_grad_norm(parameters)
-
-    print(
-        f"Gradient norm: {grad_norm:.8f}, "
-        f"gradient tensors: {grad_tensors}",
-        flush=True,
+    final_loss, final_margin, final_advantage = (
+        evaluate_policy()
     )
 
-    if not math.isfinite(grad_norm) or grad_norm <= 0:
-        raise RuntimeError("No valid training gradients")
-
-    probe_name, probe = choose_probe_parameter(
-        adapter.model
-    )
-    before = probe_snapshot(probe)
-
-    optimizer.step()
-    torch.cuda.synchronize()
-
-    delta = probe_delta(probe, before)
-
+    print()
+    print("=" * 90, flush=True)
+    print("VIDEO4B DPO PREFLIGHT SUMMARY", flush=True)
+    print(f"Initial loss:      {initial_loss:.8f}", flush=True)
+    print(f"Final loss:        {final_loss:.8f}", flush=True)
     print(
-        f"Probe parameter: {probe_name}",
+        f"Loss change:       {final_loss - initial_loss:+.8f}",
         flush=True,
     )
     print(
-        f"Parameter update norm: {delta:.8e}",
+        f"Initial margin:    {initial_margin:.6f}",
         flush=True,
     )
     print(
-        f"Peak GPU memory: "
+        f"Final margin:      {final_margin:.6f}",
+        flush=True,
+    )
+    print(
+        f"Final advantage:   {final_advantage:.6f}",
+        flush=True,
+    )
+    print(
+        f"Changed sampled values across 5 steps: "
+        f"{changed_values_total}",
+        flush=True,
+    )
+    print(
+        f"Peak GPU memory:   "
         f"{torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB",
         flush=True,
     )
-
-    if delta <= 0:
-        raise RuntimeError(
-            "Optimiser did not change the probe parameter"
-        )
-
     print(
-        "PREFLIGHT PASSED — model and temporary embedding "
-        "discarded on process exit",
+        "No checkpoints, embeddings or reference files saved.",
         flush=True,
     )
+    print("=" * 90, flush=True)
+
+    if changed_values_total == 0:
+        raise RuntimeError(
+            "No stored BF16 parameter changes detected"
+        )
+
+    if not final_margin > initial_margin:
+        raise RuntimeError(
+            "DPO failed to increase the chosen-rejected margin"
+        )
+
+    if not final_loss < initial_loss:
+        raise RuntimeError(
+            "DPO loss did not decrease"
+        )
+
+    print("VIDEO4B DPO PREFLIGHT PASSED", flush=True)
+
 
 
 def load_embedding(
@@ -2558,7 +2733,11 @@ def build_optimizer(
 
     optimizer = Adafactor(
         parameters,
-        lr=PAPER_LR[method],
+        lr=(
+            1e-5
+            if isinstance(adapter, Video4bAdapter) and method == "dpo"
+            else PAPER_LR[method]
+        ),
         eps=(1e-30, 1e-3),
         clip_threshold=1.0,
         decay_rate=-0.8,
@@ -4899,7 +5078,7 @@ def train(
     )
 
     print(
-        f"SEA LR={PAPER_LR[args.method]}",
+        f"SEA LR={1e-5 if args.model == 'video4b' else PAPER_LR[args.method]}",
         flush=True,
     )
 
