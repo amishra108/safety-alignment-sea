@@ -243,6 +243,11 @@ class GMAdapter:
         instruction = self.instruction(row)
         target = row["new_chosen_response"]
 
+        if row["category"] == "harmless":
+            return self.adapter.training_batch(
+                instruction, target, with_audio=False
+            )
+
         if self.name == "qwen25_omni":
             self.adapter.silence_path = path
             return self.adapter.training_batch(
@@ -303,14 +308,18 @@ def run_name(args):
     )
 
 
-def output_paths(args):
-    name = run_name(args)
-
-    output = OUTPUT_ROOT / name
-    model = (
-        ROOT / "models" / MODEL_FOLDERS[args.model] / name
+def epoch_model_path(args, epoch):
+    name = (
+        f"{MODEL_PREFIXES[args.model]}"
+        f"_lr2e-05_epoch{epoch}_final"
     )
-    return output, model
+    return ROOT / "models" / MODEL_FOLDERS[args.model] / name
+
+
+def output_paths(args):
+    return OUTPUT_ROOT / run_name(args), epoch_model_path(
+        args, args.epochs
+    )
 
 
 def append_metric(path, record):
@@ -602,6 +611,17 @@ def train(args, adapter, optimizer, parameters, rows, audios, output):
             epoch + 1, 0, step
         )
 
+        epoch_model = epoch_model_path(args, epoch)
+        if epoch_model.exists():
+            if not args.resume:
+                raise RuntimeError(
+                    f"Refusing to overwrite epoch model: {epoch_model}"
+                )
+            print(f"Retaining existing epoch model: {epoch_model}", flush=True)
+        else:
+            adapter.save(epoch_model, args.model_path)
+            print(f"Saved epoch {epoch}: {epoch_model}", flush=True)
+
         print(
             f"Completed epoch {epoch}/{args.epochs}",
             flush=True,
@@ -685,12 +705,10 @@ def main():
         rows, audios, output
     )
 
-    if final_model.exists():
+    if not final_model.exists():
         raise RuntimeError(
-            f"Refusing to overwrite {final_model}"
+            f"Final epoch model was not saved: {final_model}"
         )
-
-    adapter.save(final_model, args.model_path)
 
     metadata = {
         "method": "gm_sft",
