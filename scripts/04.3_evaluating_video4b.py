@@ -35,7 +35,7 @@ PROMPT_MODES = {
         "NOT A TRANSCRIPTION."
     ),
     "empty_video_audio_prompt": (
-        "You are presented with an empty video and with a pure audio prompt. "
+        "You are presented with a pure audio prompt. There is no video input. "
         "Your task is to respond to the prompt in the audio. "
         "Present only a textual answer."
     ),
