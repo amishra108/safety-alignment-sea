@@ -139,11 +139,22 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--preflight-text-only",
+        action="store_true",
+        help="Validate one harmless Video4B text-only SFT optimiser step.",
+    )
+    p.add_argument(
         "--overwrite",
         action="store_true",
     )
 
     args = p.parse_args()
+
+    if args.preflight_text_only:
+        if args.model != "video4b" or args.method != "sft":
+            p.error("--preflight-text-only requires --model video4b --method sft")
+        if args.preflight:
+            p.error("--preflight-text-only cannot be combined with --preflight")
 
     if args.mode == "train":
         if args.model_path is None:
@@ -1741,6 +1752,146 @@ class Salmonn2Adapter:
 from video4b_stage3 import Video4bAdapter
 
 
+def run_video4b_text_only_preflight(adapter, args, rows):
+    index = 2000
+    row = rows[index]
+
+    instruction, embedding, with_audio = sample_inputs(
+        args, rows, index
+    )
+
+    if row["category"] != "harmless":
+        raise RuntimeError("Selected row is not harmless")
+
+    if instruction != row["prompt"]:
+        raise RuntimeError("Text-only instruction differs from original prompt")
+
+    if embedding is not None or with_audio:
+        raise RuntimeError("Harmless example incorrectly uses audio")
+
+    adapter.prepare_for_training()
+    adapter.model.train()
+
+    optimizer, parameters = build_optimizer(adapter, "sft")
+    optimizer.zero_grad(set_to_none=True)
+
+    print("=" * 80, flush=True)
+    print("VIDEO4B HARMLESS TEXT-ONLY SFT PREFLIGHT", flush=True)
+    print(f"Dataset row: {index}", flush=True)
+    print(f"Prompt: {instruction}", flush=True)
+    print(f"Chosen response: {row['new_chosen_response']}", flush=True)
+    print("Audio embedding: None", flush=True)
+    print("with_audio: False", flush=True)
+
+    output, batch = forward_target(
+        adapter,
+        instruction,
+        row["new_chosen_response"],
+        embedding,
+        with_audio,
+    )
+
+    if any("audio" in key.lower() for key in batch):
+        raise RuntimeError(
+            f"Text-only batch contains audio fields: {list(batch)}"
+        )
+
+    audio_token_id = adapter.backend.audio_token_id
+    if (batch["input_ids"] == audio_token_id).any().item():
+        raise RuntimeError("Text-only batch contains audio placeholder tokens")
+
+    labels = batch["labels"]
+    target_tokens = int(labels.ne(-100).sum().item())
+
+    if target_tokens <= 0:
+        raise RuntimeError("No assistant response tokens are supervised")
+
+    loss = output.loss
+    if loss is None or not torch.isfinite(loss).item():
+        raise RuntimeError("Text-only SFT loss is invalid")
+
+    initial_loss = float(loss.detach().float().cpu())
+
+    loss.backward()
+
+    grad_norm, grad_tensors = global_grad_norm(parameters)
+
+    if not math.isfinite(grad_norm) or grad_norm <= 0 or grad_tensors <= 0:
+        raise RuntimeError(
+            f"Invalid gradients: norm={grad_norm}, tensors={grad_tensors}"
+        )
+
+    named_trainable = [
+        (name, parameter)
+        for name, parameter in adapter.model.named_parameters()
+        if parameter.requires_grad
+    ]
+
+    snapshots = sampled_parameter_snapshot(
+        named_trainable, samples_per_tensor=32
+    )
+
+    optimizer.step()
+    torch.cuda.synchronize()
+
+    changes = compare_parameter_snapshot(snapshots)
+    state = optimizer_state_summary(optimizer)
+
+    if changes["changed_values"] <= 0:
+        raise RuntimeError("Adafactor did not change sampled stored weights")
+
+    if state["max_step"] is None or state["max_step"] < 1:
+        raise RuntimeError("Adafactor state did not advance")
+
+    report = {
+        "model": "video4b",
+        "method": "sft",
+        "index": index,
+        "category": row["category"],
+        "input_mode": "text_only",
+        "prompt": instruction,
+        "target": row["new_chosen_response"],
+        "with_audio": with_audio,
+        "audio_embedding": None,
+        "batch_keys": list(batch.keys()),
+        "target_tokens": target_tokens,
+        "loss": initial_loss,
+        "gradient_norm": grad_norm,
+        "gradient_tensors": grad_tensors,
+        "parameter_changes": changes,
+        "adafactor_state": state,
+        "peak_gpu_gib": torch.cuda.max_memory_allocated() / 1024**3,
+        "passed": True,
+    }
+
+    output_path = (
+        RUN_ROOT
+        / "video4b"
+        / "preflight"
+        / "harmless_text_only_sft.json"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Batch keys: {report['batch_keys']}", flush=True)
+    print(f"Supervised target tokens: {target_tokens}", flush=True)
+    print(f"Loss: {initial_loss:.8f}", flush=True)
+    print(f"Gradient norm: {grad_norm:.8f}", flush=True)
+    print(f"Gradient tensors: {grad_tensors}", flush=True)
+    print(
+        f"Changed stored values: {changes['changed_values']}/"
+        f"{changes['sampled_values']}",
+        flush=True,
+    )
+    print(f"Adafactor step: {state['max_step']}", flush=True)
+    print(f"Peak GPU memory: {report['peak_gpu_gib']:.2f} GiB", flush=True)
+    print(f"Report: {output_path}", flush=True)
+    print("VIDEO4B HARMLESS TEXT-ONLY SFT PREFLIGHT PASSED", flush=True)
+
+
 def run_video4b_preflight(adapter, args, rows):
     import math
 
@@ -2107,7 +2258,7 @@ def validate_embedding_bank(
         ).is_file()
     ]
 
-    if args.preflight:
+    if args.preflight or args.preflight_text_only:
         if missing:
             print(
                 "Preflight mode: full 2000-row bank "
@@ -4861,7 +5012,7 @@ def train(
         args
     )
 
-    if args.preflight:
+    if args.preflight or args.preflight_text_only:
         print(
             f"Fast preflight enabled: searching first "
             f"{args.preflight} harmful embedding indices.",
@@ -4888,7 +5039,9 @@ def train(
                 args.model
             )
 
-        if args.model == "video4b":
+        if args.preflight_text_only:
+            run_video4b_text_only_preflight(adapter, args, rows)
+        elif args.model == "video4b":
             run_video4b_preflight(adapter, args, rows)
         else:
             run_training_preflight(
