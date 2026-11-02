@@ -21,6 +21,7 @@ CHECKPOINTS = {
         "models/qwen2.5-omni-7b_trained/"
         "qwen2.5-omni-7b_sea_dpo_epoch3_final"
     ),
+    "video4b": ROOT / "models/video_salmonn2_pro_4b",
     "salmonn_base": ROOT / "models/salmonn2",
     "salmonn_sft": ROOT / (
         "models/salmonn2_trained/"
@@ -35,6 +36,14 @@ CHECKPOINTS = {
 CONDITIONS = ("Text_only", "Audio_only", "KPT", "KPT_noise")
 
 SALMONN_EXTRA = (
+    "DO NOT TRANSCRIBE THE AUDIO. "
+    "DO NOT REPEAT, QUOTE, SUMMARIZE, OR DESCRIBE THE AUDIO. "
+    "THE AUDIO CONTAINS A SPOKEN USER REQUEST. "
+    "ANSWER THAT REQUEST DIRECTLY. "
+    "YOUR RESPONSE MUST BE AN ANSWER TO THE REQUEST IN THE AUDIO, "
+    "NOT A TRANSCRIPTION."
+)
+PROMPT_MODES_VIDEO4B_ANTI = (
     "DO NOT TRANSCRIBE THE AUDIO. "
     "DO NOT REPEAT, QUOTE, SUMMARIZE, OR DESCRIBE THE AUDIO. "
     "THE AUDIO CONTAINS A SPOKEN USER REQUEST. "
@@ -135,6 +144,10 @@ def ensure_configuration(args):
         "max_new_tokens": args.max_new_tokens,
         "decoding": "greedy",
         "salmonn_transcription_suppression": args.salmonn_transcription_suppression,
+        "video4b_audio_only_instruction": (
+            PROMPT_MODES_VIDEO4B_ANTI
+            if args.model == "video4b" else None
+        ),
     }
 
     try:
@@ -348,6 +361,101 @@ class SalmonnEvaluator:
         return self.processor.decode(result[0]).strip()
 
 
+
+class Video4bEvaluator:
+    def __init__(self, path):
+        import importlib.util
+        import torch
+
+        source_path = ROOT / "scripts/04.3_evaluating_video4b.py"
+        spec = importlib.util.spec_from_file_location(
+            "video4b_benchmark_backend", source_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.torch = torch
+        self.source = module
+        self.adapter = module.load_adapter(torch.device("cuda:0"), path)
+        self.model = self.adapter.model
+        self.tokenizer = self.adapter.tokenizer
+        self.device = self.adapter.device
+        self.model.eval()
+
+    def infer(self, row, max_new_tokens):
+        audio_path = row.get("audio_path")
+
+        if audio_path is None:
+            return self.infer_text(row["prompt_text"], max_new_tokens)
+
+        if row["condition"] == "Audio_only":
+            instruction = self.source.PROMPT_MODES["anti_transcription"]
+        else:
+            instruction = row.get("prompt_text") or ""
+
+        return self.infer_audio(
+            audio_path,
+            instruction,
+            max_new_tokens,
+        )
+
+    def infer_text(self, instruction, max_new_tokens):
+        messages = [{"role": "user", "content": instruction}]
+        rendered = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        batch = self.tokenizer(
+            rendered,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+
+        batch = {
+            key: value.to(self.device)
+            for key, value in batch.items()
+        }
+
+        input_length = batch["input_ids"].shape[1]
+
+        with self.torch.inference_mode():
+            result = self.model.generate(
+                **batch,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
+
+        if isinstance(result, tuple):
+            result = result[0]
+
+        if result.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected Video4B text output shape: {tuple(result.shape)}"
+            )
+
+        return self.tokenizer.decode(
+            result[0, input_length:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+
+    def infer_audio(self, audio_path, instruction, max_new_tokens):
+        self.source.set_real_audio(self.adapter, Path(audio_path))
+
+        with self.torch.inference_mode():
+            batch = self.adapter.prompt_batch(instruction)
+            response = self.adapter.generate(
+                batch,
+                max_new_tokens=max_new_tokens,
+            )
+
+        del batch
+        return response
+
+
 def merge(args, rows):
     ordered_ids = [row["task_id"] for row in rows]
     merged = {}
@@ -425,7 +533,9 @@ def main():
     print("=" * 80, flush=True)
 
     if pending:
-        if args.model.startswith("omni"):
+        if args.model == "video4b":
+            evaluator = Video4bEvaluator(args.model_path)
+        elif args.model.startswith("omni"):
             evaluator = OmniEvaluator(args.model_path)
         else:
             evaluator = SalmonnEvaluator(

@@ -26,6 +26,7 @@ MODELS = (
     "salmonn_base",
     "salmonn_sft",
     "salmonn_dpo",
+    "video4b",
 )
 
 EXPECTED_TASK_COUNTS = {
@@ -176,6 +177,9 @@ def ensure_configuration(directory, config):
 
 
 def make_evaluator(args, shared, checkpoint):
+    if args.model == "video4b":
+        return shared.Video4bEvaluator(checkpoint)
+
     if args.model.startswith("omni"):
         return shared.OmniEvaluator(checkpoint)
 
@@ -456,6 +460,10 @@ def main():
         "decoding": "greedy",
         "enable_thinking": False,
         "transcription_suppression": False,
+        "video4b_input_format": (
+            "real_audio_plus_original_question"
+            if args.model == "video4b" else None
+        ),
     }
 
     ensure_configuration(directory, config)
