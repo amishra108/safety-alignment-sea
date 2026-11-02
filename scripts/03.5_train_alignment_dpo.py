@@ -41,6 +41,15 @@ VALIDATION_SEED = 42
 VALIDATION_MAX_NEW_TOKENS = 1024
 VALIDATION_INSTRUCTION = None
 
+VIDEO4B_ANTI_TRANSCRIPTION_INSTRUCTION = (
+    "DO NOT TRANSCRIBE THE AUDIO. "
+    "DO NOT REPEAT, QUOTE, SUMMARIZE, OR DESCRIBE THE AUDIO. "
+    "THE AUDIO CONTAINS A SPOKEN USER REQUEST. "
+    "ANSWER THAT REQUEST DIRECTLY. "
+    "YOUR RESPONSE MUST BE AN ANSWER TO THE REQUEST IN THE AUDIO, "
+    "NOT A TRANSCRIPTION."
+)
+
 VALIDATION_CONDITIONS = (
     "original",
     "literal",
@@ -77,6 +86,15 @@ def parse_args():
         required=True,
     )
     p.set_defaults(method="dpo")
+
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--decode-examples", type=int, default=None)
+    p.add_argument("--decode-max-new-tokens", type=int, default=1024)
+    p.add_argument(
+        "--decode-before-training",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
 
     p.add_argument("--model-path", type=Path)
     p.add_argument(
@@ -178,6 +196,28 @@ def parse_args():
         if args.preflight < 0:
             p.error("--preflight must be nonnegative")
 
+    if args.lr is None:
+        args.lr = (
+            1e-5
+            if args.model == "video4b" and args.method == "dpo"
+            else PAPER_LR[args.method]
+        )
+
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        p.error("--lr must be finite and positive")
+
+    if args.decode_examples is None:
+        args.decode_examples = 30 if args.model == "video4b" else 10
+
+    if args.decode_examples < 0 or args.decode_examples > 50 or args.decode_examples % 2:
+        p.error("--decode-examples must be even and between 0 and 50")
+
+    if args.decode_max_new_tokens < 1:
+        p.error("--decode-max-new-tokens must be positive")
+
+    if args.decode_before_training is None:
+        args.decode_before_training = args.model != "video4b"
+
     return args
 
 
@@ -188,9 +228,12 @@ def run_tag(args):
         else "nodecode"
     )
 
+    lr_tag = f"_lr{args.lr:.0e}" if args.model == "video4b" else ""
+
     return (
         f"{args.method}"
         f"_e{args.epochs}"
+        f"{lr_tag}"
         f"_{decode_tag}"
         f"_final"
     )
@@ -208,11 +251,14 @@ def model_epoch_dir(
     args,
     epoch,
 ):
+    lr_tag = f"_lr{args.lr:.0e}" if args.model == "video4b" else ""
+
     return (
-        MODEL_ROOT
+        (MODEL_ROOT / "video4b_trained" if args.model == "video4b" else MODEL_ROOT)
         / (
             f"{args.model_path.name}"
             f"_sea_dpo"
+            f"{lr_tag}"
             f"_epoch{epoch}"
             f"_final"
         )
@@ -2733,11 +2779,7 @@ def build_optimizer(
 
     optimizer = Adafactor(
         parameters,
-        lr=(
-            1e-5
-            if isinstance(adapter, Video4bAdapter) and method == "dpo"
-            else PAPER_LR[method]
-        ),
+        lr=getattr(adapter, "training_lr", PAPER_LR[method]),
         eps=(1e-30, 1e-3),
         clip_threshold=1.0,
         decay_rate=-0.8,
@@ -3640,7 +3682,8 @@ def run_audio_validation(
             f"found {len(benign)}"
         )
 
-    rows = harmful[:5] + benign[:5]
+    per_split = args.decode_examples // 2
+    rows = harmful[:per_split] + benign[:per_split]
 
     torch.cuda.empty_cache()
 
@@ -3664,7 +3707,27 @@ def run_audio_validation(
         / "validation_progress.log"
     )
 
-    if output_path.exists():
+    completed_ids = set()
+
+    if args.model == "video4b":
+        if output_path.exists():
+            with output_path.open(encoding="utf-8") as f:
+                for line_number, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            f"Invalid validation JSONL at {output_path}:"
+                            f"{line_number}"
+                        ) from exc
+                    if record.get("epoch") != epoch:
+                        raise RuntimeError(
+                            f"Validation epoch mismatch: {output_path}"
+                        )
+                    completed_ids.add(record["example_id"])
+    elif output_path.exists():
         output_path.unlink()
 
     previous_training = (
@@ -3706,6 +3769,15 @@ def run_audio_validation(
         rows,
         start=1,
     ):
+        if row["example_id"] in completed_ids:
+            print(
+                f"VALIDATION RESUME epoch={epoch} "
+                f"{position}/{len(rows)} "
+                f"example={row['example_id']}",
+                flush=True,
+            )
+            continue
+
         audio_path = (
             ROOT
             / row["audio_path"]
@@ -3714,8 +3786,12 @@ def run_audio_validation(
         response = (
             adapter.generate_validation_audio(
                 audio_path,
-                VALIDATION_INSTRUCTION,
-                VALIDATION_MAX_NEW_TOKENS,
+                (
+                    VIDEO4B_ANTI_TRANSCRIPTION_INSTRUCTION
+                    if args.model == "video4b"
+                    else VALIDATION_INSTRUCTION
+                ),
+                args.decode_max_new_tokens,
             )
         )
 
@@ -4444,10 +4520,7 @@ def save_metadata(
         "optimizer_reported_by_sea_paper":
             False,
         "adafactor": {
-            "lr":
-                PAPER_LR[
-                    args.method
-                ],
+            "lr": args.lr,
             "relative_step":
                 False,
             "scale_parameter":
@@ -4465,8 +4538,10 @@ def save_metadata(
         },
         "epochs":
             args.epochs,
-        "decode_validation":
-            args.decode_validation,
+        "decode_validation": args.decode_validation,
+        "decode_examples": args.decode_examples,
+        "decode_max_new_tokens": args.decode_max_new_tokens,
+        "decode_before_training": args.decode_before_training,
         "sea_paper_epochs":
             PAPER_EPOCHS,
         "sea_paper_learning_rate":
@@ -4672,7 +4747,7 @@ def check_training(
         f"epoch summaries:       {len(epochs)}"
     )
     print(
-        f"expected LR:           {PAPER_LR[args.method]:.8g}"
+        f"expected LR:           {args.lr:.8g}"
     )
     print(
         f"observed LR min/max:   "
@@ -4828,9 +4903,7 @@ def check_training(
             all(
                 math.isclose(
                     lr,
-                    PAPER_LR[
-                        args.method
-                    ],
+                    args.lr,
                     rel_tol=0.0,
                     abs_tol=1e-12,
                 )
@@ -5078,7 +5151,7 @@ def train(
     )
 
     print(
-        f"SEA LR={1e-5 if args.model == 'video4b' else PAPER_LR[args.method]}",
+        f"SEA LR={args.lr}",
         flush=True,
     )
 
@@ -5122,14 +5195,23 @@ def train(
             args.model
         )
 
+    adapter.training_lr = args.lr
+
     if args.decode_validation:
         prepare_validation_manifest()
 
-        run_audio_validation(
-            adapter,
-            args,
-            epoch=0,
-        )
+        if args.decode_before_training:
+            run_audio_validation(
+                adapter,
+                args,
+                epoch=0,
+            )
+        else:
+            print(
+                "Video4B: skipping epoch-0 decoding; "
+                "validation runs after each epoch.",
+                flush=True,
+            )
     else:
         print(
             "Real-audio decoding validation disabled.",
