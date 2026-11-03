@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import json
-import shutil
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -64,8 +63,6 @@ def main():
                 print(f'HPO EVALUATION DONE: {name}, {n} responses', flush=True)
 
             train(cfg, work, on_epoch_end=evaluate)
-            if set(epochs) == completed and not args.keep_hpo_checkpoints and not args.preflight:
-                shutil.rmtree(work)
 
 
 if __name__ == '__main__':
