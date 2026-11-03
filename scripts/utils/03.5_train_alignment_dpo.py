@@ -1793,7 +1793,7 @@ class Salmonn2Adapter:
         )
 
 
-from video4b_stage3 import Video4bAdapter
+from scripts.utils.video4b_stage3 import Video4bAdapter
 
 
 def run_video4b_preflight(adapter, args, rows):
