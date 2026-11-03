@@ -44,5 +44,14 @@ def decode_subset(adapter, cfg, checkpoint_epoch, destination):
         with destination.open('a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
             f.flush()
+        text_path = destination.with_suffix('.txt')
+        with text_path.open('w', encoding='utf-8') as text_file:
+            with destination.open(encoding='utf-8') as jsonl_file:
+                for line in jsonl_file:
+                    if line.strip():
+                        response_text = json.loads(line)['response']
+                        text_file.write(
+                            response_text.replace('\\r', ' ').replace('\\n', ' ') + '\\n'
+                        )
         print(f'DECODE {number}/{len(chosen)} {task_id}', flush=True)
     return len(chosen)
