@@ -112,9 +112,9 @@ class Video4bAdapter:
     def generate_validation_audio(
         self, audio_path, instruction, max_new_tokens
     ):
-        if instruction is not None:
+        if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError(
-                "Video4B validation expects audio-only input"
+                "Video4B validation requires a non-empty text instruction"
             )
 
         waveform, sample_rate = sf.read(
@@ -163,7 +163,7 @@ class Video4bAdapter:
         try:
             self.backend.audio_features = features
             self.backend.audio_token_count = 60 * len(chunks)
-            batch = self.backend.prompt_batch("")
+            batch = self.backend.prompt_batch(instruction)
             self.model.eval()
             return self.backend.generate(batch, max_new_tokens)
         finally:

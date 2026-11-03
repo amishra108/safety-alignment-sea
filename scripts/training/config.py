@@ -14,6 +14,14 @@ PREFIXES = {
 }
 
 
+VIDEO4B_EVAL_INSTRUCTION = (
+    'DO NOT TRANSCRIBE THE AUDIO. DO NOT REPEAT, QUOTE, SUMMARIZE, OR DESCRIBE '
+    'THE AUDIO. THE AUDIO CONTAINS A SPOKEN USER REQUEST. ANSWER THAT REQUEST '
+    'DIRECTLY. YOUR RESPONSE MUST BE AN ANSWER TO THE REQUEST IN THE AUDIO, '
+    'NOT A TRANSCRIPTION.'
+)
+
+
 def path_arg(value):
     return str(Path(value).expanduser().resolve())
 
@@ -78,8 +86,11 @@ def cli(hpo=False):
         p.error('step/example limits must be nonnegative')
     if args.audio_placeholder_seconds != 1.0:
         p.error('The existing model adapters only support 1.0 seconds of silent audio')
-    if args.eval_audio_instruction is not None:
-        p.error('Existing adapters support only audio-only validation; use --eval-audio-instruction only after an adapter supports it')
+    if args.model == 'video4b':
+        if args.eval_audio_instruction is None:
+            args.eval_audio_instruction = VIDEO4B_EVAL_INSTRUCTION
+    elif args.eval_audio_instruction is not None:
+        p.error('Qwen2.5-Omni evaluation requires audio-only input without a text instruction')
     return args
 
 

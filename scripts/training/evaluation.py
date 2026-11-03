@@ -31,7 +31,12 @@ def decode_subset(adapter, cfg, checkpoint_epoch, destination):
             'example_id': row.get('example_id'), 'english_example_id': row.get('english_example_id'),
             'split': row['split'], 'condition': row['condition'],
             'attack_type': row.get('attack_type'), 'modality': 'audio',
-            'model_input_mode': 'audio_only', 'language': row['language'],
+            'model_input_mode': (
+                'audio_only' if cfg['eval_audio_instruction'] is None
+                else 'audio_plus_fixed_instruction'
+            ),
+            'evaluation_instruction': cfg['eval_audio_instruction'],
+            'language': row['language'],
             'source_text': row.get('source_text'), 'prompt_text': row.get('prompt_text'),
             'audio_path': str(audio_path), 'response': response,
             'decoding': {'do_sample': False, 'max_new_tokens': cfg['max_new_tokens']},
