@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.training.config import cli, config_dict, run_id, write_json
+from scripts.training.config import cli, config_dict, run_id, write_json, identity
 from scripts.training.engine import train
 from scripts.training.evaluation import decode_subset
 from scripts.training.data import select_evaluation
@@ -20,6 +20,140 @@ def main():
             parent_name = run_id(args, lr, max_epoch, beta)
             work = Path(args.output_root) / '_work' / args.model / parent_name
             cfg = config_dict(args, lr, max_epoch, beta, 'scripts/hpo.py', parent_name)
+
+            if args.continue_from:
+                if len(args.learning_rates) != 1:
+                    raise ValueError(
+                        '--continue-from requires exactly one learning rate'
+                    )
+                if args.method == 'dpo' and len(args.betas) != 1:
+                    raise ValueError(
+                        '--continue-from requires exactly one DPO beta'
+                    )
+                if args.preflight:
+                    raise ValueError(
+                        '--continue-from cannot be combined with --preflight'
+                    )
+                if args.max_steps:
+                    raise ValueError(
+                        'Do not use --max-steps when extending an HPO run'
+                    )
+
+                work = Path(args.continue_from).resolve()
+                if work.is_file() and work.name == 'config.json':
+                    work = work.parent
+
+                expected_parent = (
+                    Path(args.output_root).resolve()
+                    / '_work' / args.model
+                )
+                if work.parent != expected_parent:
+                    raise ValueError(
+                        f'Continuation must use an HPO training workspace '
+                        f'under {expected_parent}, got {work}'
+                    )
+
+                existing_config_path = work / 'config.json'
+                if not existing_config_path.is_file():
+                    raise FileNotFoundError(existing_config_path)
+
+                existing = json.loads(
+                    existing_config_path.read_text(encoding='utf-8')
+                )
+
+                if identity(existing) != identity(cfg):
+                    raise ValueError(
+                        'Source HPO training configuration differs from '
+                        'the requested configuration. Check model, method, '
+                        'learning rate, beta, seed, dataset and run name.'
+                    )
+
+                previous_target = existing['epochs']
+                first_requested = min(epochs)
+
+                if max_epoch < previous_target:
+                    raise ValueError(
+                        'Cannot shorten an existing HPO training run'
+                    )
+
+                if max_epoch == previous_target:
+                    saved_first = existing.get(
+                        'hpo_continuation_first_epoch'
+                    )
+                    if saved_first != first_requested:
+                        raise ValueError(
+                            'Existing continuation target does not match '
+                            'the requested epochs'
+                        )
+                else:
+                    if first_requested != previous_target + 1:
+                        raise ValueError(
+                            f'Expected the next requested epoch to be '
+                            f'{previous_target + 1}, got {first_requested}'
+                        )
+                    if epochs != list(
+                        range(first_requested, max_epoch + 1)
+                    ):
+                        raise ValueError(
+                            'Continuation epochs must be consecutive'
+                        )
+
+                    snapshot = (
+                        work / 'checkpoints'
+                        / f'epoch_{previous_target:03d}'
+                    )
+                    if not (
+                        (snapshot / 'model.safetensors').is_file()
+                        and (snapshot / 'manifest.json').is_file()
+                    ):
+                        raise FileNotFoundError(
+                            f'Missing completed epoch checkpoint: {snapshot}'
+                        )
+
+                    pointer = work / 'resume' / 'latest.json'
+                    if not pointer.is_file():
+                        raise FileNotFoundError(
+                            f'Missing optimizer resume pointer: {pointer}'
+                        )
+
+                    resume_name = json.loads(
+                        pointer.read_text(encoding='utf-8')
+                    )['checkpoint']
+                    resume_dir = work / 'resume' / resume_name
+                    for filename in (
+                        'model.safetensors', 'manifest.json',
+                        'training.pt', 'state.json',
+                    ):
+                        if not (resume_dir / filename).is_file():
+                            raise FileNotFoundError(resume_dir / filename)
+
+                    resume_state = json.loads(
+                        (resume_dir / 'state.json').read_text(
+                            encoding='utf-8'
+                        )
+                    )
+                    if (
+                        resume_state['epoch'] != previous_target + 1
+                        or resume_state['position'] != 0
+                    ):
+                        raise ValueError(
+                            'The previous training target has not completed '
+                            'cleanly; finish or resume that run first'
+                        )
+
+                    existing['epochs'] = max_epoch
+                    existing['hpo_continuation_first_epoch'] = (
+                        first_requested
+                    )
+                    write_json(existing_config_path, existing)
+
+                cfg['resume'] = 'required'
+                print(
+                    f'HPO CONTINUATION: {work} '
+                    f'epochs={epochs} lr={lr} beta={beta}',
+                    flush=True,
+                )
+
             completed = set()
             def result_name(epoch):
                 return run_id(args, lr, epoch, beta)

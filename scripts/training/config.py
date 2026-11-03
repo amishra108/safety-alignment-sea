@@ -67,6 +67,7 @@ def cli(hpo=False):
     p.add_argument('--eval-audio-instruction', default=None)
     p.add_argument('--max-new-tokens', type=int, default=1024)
     p.add_argument('--keep-hpo-checkpoints', action='store_true') if hpo else None
+    p.add_argument('--continue-from', type=path_arg) if hpo else None
     args = p.parse_args()
     args.embedding_dir = args.embedding_dir or str(ROOT / 'outputs/utils_and_prev_evals/02_optimised_embeddings' / args.model)
     args.reference_model_path = args.reference_model_path or args.model_path
@@ -101,6 +102,7 @@ def format_lr(x):
 def config_dict(args, lr, epochs, beta, entry_script, run_id):
     data = vars(args).copy()
     data.pop('keep_hpo_checkpoints', None)
+    data.pop('continue_from', None)
     data.pop('learning_rates', None)
     data.pop('epoch_values', None)
     data.pop('betas', None)
@@ -139,7 +141,7 @@ def run_id(args, lr, epochs, beta):
 
 
 def identity(cfg):
-    ignore = {'created_at', 'entry_script', 'run_id', 'output_root', 'resume', 'preflight', 'log_every', 'save_every_steps', 'eval_examples', 'eval_conditions', 'eval_selection', 'eval_seed', 'eval_split', 'eval_language', 'max_new_tokens', 'eval_manifest', 'decoding', 'max_steps', 'epochs', 'model_runtime', 'decode_after_each_epoch'}
+    ignore = {'created_at', 'entry_script', 'run_id', 'output_root', 'resume', 'preflight', 'log_every', 'save_every_steps', 'eval_examples', 'eval_conditions', 'eval_selection', 'eval_seed', 'eval_split', 'eval_language', 'max_new_tokens', 'eval_manifest', 'decoding', 'max_steps', 'epochs', 'model_runtime', 'decode_after_each_epoch', 'hpo_continuation_first_epoch'}
     x = {k: v for k, v in cfg.items() if k not in ignore}
     return hashlib.sha256(json.dumps(x, sort_keys=True).encode()).hexdigest()
 
