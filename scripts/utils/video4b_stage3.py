@@ -13,7 +13,7 @@ ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment-sea")
 
 
 def load_stage2():
-    path = ROOT / "scripts/02_optimise_embedding.py"
+    path = ROOT / "scripts/utils/02_optimise_embedding.py"
     spec = importlib.util.spec_from_file_location(
         "video4b_stage2_adapter", path
     )
