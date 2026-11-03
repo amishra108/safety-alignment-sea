@@ -23,7 +23,7 @@ def decode_subset(adapter, cfg, checkpoint_epoch, destination):
                     done.add(record['task_id'])
                     response_text = record['response']
                     text_file.write(
-                        response_text.replace('\\r', r'\\r').replace('\\n', r'\\n') + '\\n'
+                        response_text.replace('\r', r'\r').replace('\n', r'\n') + '\n'
                     )
 
     for number, row in enumerate(chosen, 1):
@@ -60,7 +60,7 @@ def decode_subset(adapter, cfg, checkpoint_epoch, destination):
             f.flush()
         with text_path.open('a', encoding='utf-8') as text_file:
             text_file.write(
-                response.replace('\\r', r'\\r').replace('\\n', r'\\n') + '\\n'
+                response.replace('\r', r'\r').replace('\n', r'\n') + '\n'
             )
             text_file.flush()
 
