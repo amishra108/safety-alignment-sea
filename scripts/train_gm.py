@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--audio-manifest", type=Path, default=DEFAULT_AUDIO_MANIFEST)
     parser.add_argument("--output-root", type=Path, default=ROOT / "outputs/_gm")
     parser.add_argument("--resume", choices=("auto", "never", "required"), default="auto")
-    parser.add_argument("--save-every-steps", type=int, default=100)
+    parser.add_argument("--save-every-steps", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--preflight", action="store_true")
@@ -137,7 +137,7 @@ def parse_args():
     if cfg["beta"] <= 0 or cfg["grad_accum"] < 1:
         parser.error("Beta and gradient accumulation must be positive")
 
-    if args.save_every_steps < 1 or args.log_every < 1:
+    if args.save_every_steps < 0 or args.log_every < 1:
         parser.error("Save/log intervals must be positive")
 
     if args.max_steps < 0:
@@ -262,6 +262,54 @@ def load_audio_paths(cfg, rows):
         paths[index] = audio_path
 
     return paths
+
+
+def training_input_record(row, index, cfg, paths):
+    return {
+        "index": index,
+        "category": row["category"],
+        "phrase_type": row.get("phrase_type"),
+        "instruction": instruction_for(row, cfg),
+        "with_audio": row["category"] == "harmful",
+        "audio_path": str(paths[index].resolve()) if index in paths else None,
+        "chosen_response": row["new_chosen_response"],
+        "rejected_response": (
+            row["rejected_response"] if cfg["method"] == "dpo" else None
+        ),
+    }
+
+
+def load_recorded_inputs(path, rows, cfg, paths):
+    recorded = {}
+    if not path.exists():
+        return recorded
+
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+
+            item = json.loads(line)
+            index = item["index"]
+
+            if not isinstance(index, int) or not 0 <= index < len(rows):
+                raise ValueError(f"Invalid GM training input index: {index}")
+
+            if index in recorded:
+                if recorded[index] != item:
+                    raise ValueError(f"Conflicting GM input records for row {index}")
+                raise ValueError(f"Duplicate GM input record for row {index}")
+
+            expected = training_input_record(rows[index], index, cfg, paths)
+            if item != expected:
+                raise ValueError(
+                    f"GM training input changed for row {index}: "
+                    f"recorded={item!r}, current={expected!r}"
+                )
+
+            recorded[index] = item
+
+    return recorded
 
 
 def load_waveform(path):
@@ -553,6 +601,8 @@ def train(cfg, root):
         ]
 
     paths = load_audio_paths(cfg, rows)
+    inputs_path = root / "training_inputs.jsonl"
+    recorded_inputs = load_recorded_inputs(inputs_path, rows, cfg, paths)
 
     device = torch.device("cuda:0")
     set_seed(cfg["seed"])
@@ -635,9 +685,19 @@ def train(cfg, root):
         for start in range(offset, len(order), cfg["grad_accum"]):
             group = order[start:start + cfg["grad_accum"]]
             metrics = []
+            step_inputs = []
 
             for index in group:
                 row = rows[index]
+                input_record = training_input_record(row, index, cfg, paths)
+
+                if (
+                    index in recorded_inputs
+                    and recorded_inputs[index] != input_record
+                ):
+                    raise ValueError(f"GM training input changed for row {index}")
+
+                step_inputs.append(input_record)
 
                 value, extra = train_step(
                     adapter, audio, row, index, cfg, paths,
@@ -659,6 +719,12 @@ def train(cfg, root):
 
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+            for input_record in step_inputs:
+                index = input_record["index"]
+                if index not in recorded_inputs:
+                    append_jsonl(inputs_path, input_record)
+                    recorded_inputs[index] = input_record
 
             state = {
                 "epoch": epoch,
@@ -701,7 +767,7 @@ def train(cfg, root):
                 print("GM PREFLIGHT PASSED", flush=True)
                 return
 
-            if state["global_step"] % cfg["save_every_steps"] == 0:
+            if cfg["save_every_steps"] and state["global_step"] % cfg["save_every_steps"] == 0:
                 manager.save_resume(adapter.model, optimizer, state)
 
             if (
