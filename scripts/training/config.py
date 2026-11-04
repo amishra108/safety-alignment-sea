@@ -141,7 +141,7 @@ def run_id(args, lr, epochs, beta):
 
 
 def identity(cfg):
-    ignore = {'created_at', 'entry_script', 'run_id', 'output_root', 'resume', 'preflight', 'log_every', 'save_every_steps', 'eval_examples', 'eval_conditions', 'eval_selection', 'eval_seed', 'eval_split', 'eval_language', 'max_new_tokens', 'eval_manifest', 'decoding', 'max_steps', 'epochs', 'model_runtime', 'decode_after_each_epoch', 'hpo_continuation_first_epoch'}
+    ignore = {'training_inputs_file', 'created_at', 'entry_script', 'run_id', 'output_root', 'resume', 'preflight', 'log_every', 'save_every_steps', 'eval_examples', 'eval_conditions', 'eval_selection', 'eval_seed', 'eval_split', 'eval_language', 'max_new_tokens', 'eval_manifest', 'decoding', 'max_steps', 'epochs', 'model_runtime', 'decode_after_each_epoch', 'hpo_continuation_first_epoch'}
     x = {k: v for k, v in cfg.items() if k not in ignore}
     return hashlib.sha256(json.dumps(x, sort_keys=True).encode()).hexdigest()
 

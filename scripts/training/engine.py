@@ -178,6 +178,7 @@ def train(cfg, work_root, on_epoch_end=None):
     }
 
     existing = json.loads(config_path.read_text())
+    runtime = json.loads(json.dumps(runtime))
     previous_runtime = existing.get('model_runtime')
     if previous_runtime is not None:
         original_fields = {
