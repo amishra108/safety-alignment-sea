@@ -180,12 +180,24 @@ def write_text(records, path):
 
     os.replace(temporary, path)
 
+def append_text(path, record, previous_task):
+    if record.get("response") is None:
+        return previous_task
+
+    task = record["task_name"]
+
+    with path.open("a", encoding="utf-8") as f:
+        if task != previous_task:
+            f.write(f"\n=== {task.upper()} ===\n\n")
+        f.write(text_line(record["response"]))
+
+    return task
+
 
 def append_record(path, record):
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
-        os.fsync(f.fileno())
 
 
 def shard_paths(root, shard_id, count):
@@ -329,6 +341,14 @@ def main():
             completed.add(task_id)
 
         write_text(existing, txt)
+        previous_task = next(
+            (
+                record["task_name"]
+                for record in reversed(existing)
+                if record.get("response") is not None
+            ),
+            None,
+        )
 
         pending = [
             row for row in assigned if row["task_id"] not in completed
@@ -403,9 +423,8 @@ def main():
             }
 
             append_record(jsonl, record)
-            existing.append(record)
+            previous_task = append_text(txt, record, previous_task)
             completed.add(row["task_id"])
-            write_text(existing, txt)
 
             print(
                 f"[{index}/{len(pending)}] {row['task_id']} "

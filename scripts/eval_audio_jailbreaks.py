@@ -280,7 +280,6 @@ def append_response(jsonl_path, text_path, record, previous_group):
     with jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
-        os.fsync(f.fileno())
 
     with text_path.open("a", encoding="utf-8") as f:
         if group_key(record) != previous_group:
@@ -359,6 +358,61 @@ def load_model(args, checkpoint, base, kind):
     adapter.model.eval()
     if args.model == "qwen25_omni":
         adapter.omni_model.eval()
+
+    if os.environ.get("SEA_KV_AUDIT") == "1":
+        model = adapter.model
+        generator = (
+            adapter.omni_model
+            if args.model == "qwen25_omni"
+            else model
+        )
+
+        print(
+            "[kv-audit] model_config.use_cache="
+            f"{getattr(model.config, 'use_cache', None)} "
+            "generation_config.use_cache="
+            f"{getattr(generator.generation_config, 'use_cache', None)} "
+            "gradient_checkpointing="
+            f"{getattr(model, 'is_gradient_checkpointing', None)}",
+            flush=True,
+        )
+
+        calls = [0]
+
+        def inspect_forward(module, inputs, kwargs):
+            calls[0] += 1
+            if calls[0] > 6:
+                return
+
+            past = kwargs.get("past_key_values")
+            cache_position = kwargs.get("cache_position")
+            input_ids = kwargs.get("input_ids")
+            seq_length = None
+
+            if past is not None and hasattr(past, "get_seq_length"):
+                try:
+                    seq_length = past.get_seq_length()
+                except (TypeError, ValueError, AttributeError):
+                    pass
+
+            if cache_position is not None:
+                cache_position = cache_position.detach().cpu().tolist()
+
+            print(
+                f"[kv-audit] forward={calls[0]} "
+                f"use_cache={kwargs.get('use_cache')} "
+                f"past_type={type(past).__name__} "
+                f"past_length={seq_length} "
+                f"cache_position={cache_position} "
+                f"input_tokens="
+                f"{input_ids.shape[-1] if input_ids is not None else None}",
+                flush=True,
+            )
+
+        model.register_forward_pre_hook(
+            inspect_forward,
+            with_kwargs=True,
+        )
 
     return adapter
 

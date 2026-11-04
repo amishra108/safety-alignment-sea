@@ -354,12 +354,30 @@ def write_text(records, path):
             )
     os.replace(temporary, path)
 
+def append_text(path, record, previous_group):
+    group = (
+        record.get("category", "unspecified"),
+        record["condition"],
+        record.get("language", ""),
+    )
+
+    with path.open("a", encoding="utf-8") as f:
+        if group != previous_group:
+            header = " | ".join(
+                str(value).upper() for value in group if value
+            )
+            f.write(f"\n=== {header} ===\n\n")
+
+        response = str(record["response"])
+        f.write(response.replace("\r", " ").replace("\n", " ") + "\n")
+
+    return group
+
 
 def append_record(path, record):
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
         f.flush()
-        os.fsync(f.fileno())
 
 
 def merge(root, rows, shards):
@@ -500,6 +518,15 @@ def main():
             completed.add(key)
 
         write_text(previous, txt)
+        previous_group = (
+            (
+                previous[-1].get("category", "unspecified"),
+                previous[-1]["condition"],
+                previous[-1].get("language", ""),
+            )
+            if previous else None
+        )
+
         pending = [
             row for row in assigned
             if row["task_id"] not in completed
@@ -560,10 +587,8 @@ def main():
                 }
 
                 append_record(output, record)
-                previous.append(record)
+                previous_group = append_text(txt, record, previous_group)
                 completed.add(row["task_id"])
-
-                write_text(previous, txt)
 
                 print(
                     f'[{i}/{len(pending)}] {row["task_id"]} '
