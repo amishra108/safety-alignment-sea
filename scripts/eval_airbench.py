@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import fcntl
 import json
 import os
 import socket
@@ -16,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.eval_audio_jailbreaks import (
     MODEL_OUTPUT_NAMES,
     atomic_json,
+    directory_lock,
     load_model,
     read_jsonl,
     resolve_checkpoint,
@@ -212,8 +212,7 @@ def shard_paths(root, shard_id, count):
 
 
 def merge(root, rows, count):
-    with (root / ".merge.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with directory_lock(root / ".merge.lock"):
 
         for i in range(count):
             _, _, done = shard_paths(root, i, count)
@@ -328,8 +327,7 @@ def main():
 
     stem = f"shard{args.shard_id:03d}-of-{args.num_shards:03d}"
 
-    with (jsonl.parent / f"{stem}.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with directory_lock(jsonl.parent / f"{stem}.lock"):
 
         existing = read_jsonl(jsonl, repair=True)
         completed = set()

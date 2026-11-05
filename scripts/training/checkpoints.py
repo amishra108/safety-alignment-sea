@@ -6,7 +6,8 @@ import tempfile
 from pathlib import Path
 import numpy as np
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 from .config import write_json
 
 
@@ -29,20 +30,64 @@ def save_weights(model, path):
 
 
 def load_weights(model, path):
-    manifest = json.loads((path / 'manifest.json').read_text())
-    expected = set(named_trainable(model))
-    if set(manifest['trainable_names']) != expected:
-        raise RuntimeError('Trainable-parameter names differ from saved checkpoint')
-    weights = load_file(str(path / 'model.safetensors'), device='cpu')
-    if set(weights) != expected:
-        raise RuntimeError('Checkpoint trainable weight names mismatch')
+    path = Path(path)
+    manifest = json.loads((path / "manifest.json").read_text())
+
     params = named_trainable(model)
-    with torch.no_grad():
-        for name, tensor in weights.items():
-            p = params[name]
-            if p.shape != tensor.shape or p.dtype != tensor.dtype:
-                raise RuntimeError(f'Checkpoint shape/dtype mismatch: {name}')
-            p.copy_(tensor.to(p.device))
+    expected = set(params)
+
+    if set(manifest["trainable_names"]) != expected:
+        raise RuntimeError("Trainable-parameter names differ from saved checkpoint")
+
+    checkpoint_path = path / "model.safetensors"
+
+    with safe_open(str(checkpoint_path), framework="pt", device="cpu") as checkpoint:
+        saved_names = set(checkpoint.keys())
+
+        if saved_names != expected:
+            raise RuntimeError("Checkpoint trainable weight names mismatch")
+
+        total = len(expected)
+        reported_conversions = set()
+
+        with torch.no_grad():
+            for index, name in enumerate(sorted(expected), 1):
+                tensor = checkpoint.get_tensor(name)
+                parameter = params[name]
+
+                if parameter.shape != tensor.shape:
+                    raise RuntimeError(
+                        f"Checkpoint shape mismatch: {name}: "
+                        f"saved={tuple(tensor.shape)}, "
+                        f"model={tuple(parameter.shape)}"
+                    )
+
+                if parameter.dtype != tensor.dtype:
+                    if not (parameter.is_floating_point() and tensor.is_floating_point()):
+                        raise RuntimeError(
+                            f"Checkpoint dtype mismatch: {name}: "
+                            f"saved={tensor.dtype}, model={parameter.dtype}"
+                        )
+
+                    conversion = (tensor.dtype, parameter.dtype)
+                    if conversion not in reported_conversions:
+                        print(
+                            f"Checkpoint floating-point conversion: "
+                            f"{tensor.dtype} -> {parameter.dtype}",
+                            flush=True,
+                        )
+                        reported_conversions.add(conversion)
+
+                parameter.copy_(tensor)
+                del tensor
+
+                if index == 1 or index % 100 == 0 or index == total:
+                    print(
+                        f"Loading checkpoint: {index}/{total} tensors",
+                        flush=True,
+                    )
+
+    print(f"Checkpoint loaded: {checkpoint_path}", flush=True)
 
 
 class CheckpointManager:

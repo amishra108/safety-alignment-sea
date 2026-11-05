@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import fcntl
+from contextlib import contextmanager
 import json
 import os
 import socket
@@ -44,6 +44,27 @@ QWEN_GENERATION = {
     "thinker_do_sample": False,
     "use_audio_in_video": False,
 }
+
+
+@contextmanager
+def directory_lock(path):
+    lock_dir = Path(str(path) + ".dir")
+
+    try:
+        lock_dir.mkdir()
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"Evaluation lock already exists: {lock_dir}. "
+            "Another process may be running, or a previous process "
+            "may have terminated without cleaning up its lock. "
+            "Verify that no process is using this shard before "
+            "removing a stale lock directory."
+        ) from exc
+
+    try:
+        yield
+    finally:
+        lock_dir.rmdir()
 
 
 def parse_args():
@@ -573,8 +594,7 @@ def video_generate(adapter, args, row):
 def merge(root, rows, modalities, shards):
     lock_path = root / ".merge.lock"
 
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with directory_lock(lock_path):
 
         shard_dir = root / "shards"
         if any(
@@ -716,8 +736,7 @@ def main():
     jsonl = shard_dir / f"responses.{stem}.jsonl"
     txt = shard_dir / f"responses.{stem}.txt"
 
-    with (shard_dir / f"{stem}.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with directory_lock(shard_dir / f"{stem}.lock"):
 
         start = len(rows) * args.shard_id // args.num_shards
         end = len(rows) * (args.shard_id + 1) // args.num_shards

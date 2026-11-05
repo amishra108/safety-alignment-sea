@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import copy
-import fcntl
 import json
 import os
 import socket
@@ -18,6 +17,7 @@ from scripts.eval_audio_jailbreaks import (
     VIDEO_INSTRUCTION,
     MODEL_OUTPUT_NAMES,
     atomic_json,
+    directory_lock,
     load_model,
     read_jsonl,
     resolve_checkpoint,
@@ -381,8 +381,7 @@ def append_record(path, record):
 
 
 def merge(root, rows, shards):
-    with (root / ".merge.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with directory_lock(root / ".merge.lock"):
 
         shard_dir = root / "shards"
         for i in range(shards):
@@ -498,8 +497,7 @@ def main():
     output = shard_dir / f"responses.{stem}.jsonl"
     txt = shard_dir / f"responses.{stem}.txt"
 
-    with (shard_dir / f"{stem}.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with directory_lock(shard_dir / f"{stem}.lock"):
 
         start = len(rows) * args.shard_id // args.num_shards
         end = len(rows) * (args.shard_id + 1) // args.num_shards
