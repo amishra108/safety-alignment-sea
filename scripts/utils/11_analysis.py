@@ -370,89 +370,99 @@ def make_grid(rows, field, layers, matrices):
     ])
 
 
+
 def create_pdf(path, norm_rows, direction_rows):
-    for_model = ("omni", "video4b")
+    output_dir = path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    with PdfPages(path) as pdf:
-        for model in for_model:
-            for method in ("sft", "dpo"):
-                nr = [
-                    row for row in norm_rows
-                    if row["model"] == model and row["method"] == method
-                ]
-                dr = [
-                    row for row in direction_rows
-                    if row["model"] == model and row["method"] == method
-                ]
+    matrix_order = [
+        "audio_proj", "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ]
 
-                layers = sorted({int(row["layer"]) for row in dr})
-                matrices = sorted({row["matrix"] for row in dr})
+    for model in ("omni", "video4b"):
+        for method in ("sft", "dpo"):
+            nr = [
+                row for row in norm_rows
+                if row["model"] == model and row["method"] == method
+            ]
+            dr = [
+                row for row in direction_rows
+                if row["model"] == model and row["method"] == method
+            ]
 
-                sea_rows = [row for row in nr if row["variant"] == "sea"]
-                gm_rows = [row for row in nr if row["variant"] == "gm"]
+            layers = [-1] + sorted({
+                int(row["layer"]) for row in dr
+                if int(row["layer"]) >= 0
+            })
+            matrices = [
+                matrix for matrix in matrix_order
+                if any(row["matrix"] == matrix for row in dr)
+            ]
 
-                shared_max = max(
-                    float(row["relative_change"]) for row in nr
+            sea_rows = [row for row in nr if row["variant"] == "sea"]
+            gm_rows = [row for row in nr if row["variant"] == "gm"]
+
+            shared_max = max(
+                max(float(row["relative_change"]) for row in nr),
+                1e-12,
+            )
+
+            panels = [
+                ("SEA relative change", sea_rows,
+                 "relative_change", 0, shared_max, "viridis"),
+                ("GM relative change", gm_rows,
+                 "relative_change", 0, shared_max, "viridis"),
+                ("SEA vs GM update cosine", dr,
+                 "update_cosine", -1, 1, "coolwarm"),
+            ]
+
+            fig, axes = plt.subplots(
+                3, 1, figsize=(19, 10),
+                constrained_layout=True,
+            )
+            fig.suptitle(
+                f"{model.upper()} — {method.upper()}",
+                fontsize=17,
+            )
+
+            for ax, (title, rows, field, vmin, vmax, cmap) in zip(
+                axes, panels
+            ):
+                # Transpose so matrices are rows and layers are columns.
+                grid = make_grid(rows, field, layers, matrices).T
+
+                image = ax.imshow(
+                    np.ma.masked_invalid(grid),
+                    aspect="auto",
+                    interpolation="nearest",
+                    cmap=cmap,
+                    vmin=vmin,
+                    vmax=vmax,
                 )
-                shared_max = max(shared_max, 1e-12)
 
-                panels = [
-                    ("SEA: relative Frobenius change", sea_rows,
-                     "relative_change", 0, shared_max, "viridis"),
-                    ("GM: relative Frobenius change", gm_rows,
-                     "relative_change", 0, shared_max, "viridis"),
-                    ("SEA-GM: full update cosine", dr,
-                     "update_cosine", -1, 1, "coolwarm"),
-                    ("Input: leading direction |cosine|", dr,
-                     "input_top1_abs_cosine", 0, 1, "viridis"),
-                    ("Output: leading direction |cosine|", dr,
-                     "output_top1_abs_cosine", 0, 1, "viridis"),
-                    ("Input: top-4 subspace similarity", dr,
-                     "input_top4_subspace", 0, 1, "viridis"),
-                    ("Output: top-4 subspace similarity", dr,
-                     "output_top4_subspace", 0, 1, "viridis"),
-                ]
+                ax.set_title(title)
+                ax.set_xticks(range(len(layers)))
+                ax.set_xticklabels([
+                    "Proj" if layer == -1 else str(layer)
+                    for layer in layers
+                ])
+                ax.set_yticks(range(len(matrices)))
+                ax.set_yticklabels(matrices)
+                ax.set_xlabel("Projector / Decoder layer")
+                ax.set_ylabel("Weight matrix")
 
-                fig, axes = plt.subplots(
-                    len(panels), 1,
-                    figsize=(15, 20),
-                    constrained_layout=True,
-                )
-                fig.suptitle(
-                    f"{model.upper()} — {method.upper()} — Weight-space analysis",
-                    fontsize=16,
+                fig.colorbar(
+                    image, ax=ax, fraction=0.015, pad=0.01
                 )
 
-                for ax, (title, rows, field, vmin, vmax, cmap) in zip(
-                    axes, panels
-                ):
-                    grid = make_grid(rows, field, layers, matrices)
-                    image = ax.imshow(
-                        np.ma.masked_invalid(grid),
-                        aspect="auto",
-                        interpolation="nearest",
-                        cmap=cmap,
-                        vmin=vmin,
-                        vmax=vmax,
-                    )
-                    ax.set_title(title)
-                    ax.set_xticks(
-                        range(len(matrices)),
-                        matrices,
-                        rotation=30,
-                        ha="right",
-                    )
-                    ax.set_yticks(
-                        range(len(layers)),
-                        ["Proj" if layer == -1 else str(layer)
-                         for layer in layers],
-                    )
-                    ax.set_ylabel("Decoder layer")
-                    fig.colorbar(image, ax=ax, fraction=0.015, pad=0.01)
+            output_path = output_dir / f"{model}_{method}.pdf"
+            fig.savefig(output_path, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved {output_path}", flush=True)
 
-                pdf.savefig(fig)
-                plt.close(fig)
-
+    if path.exists():
+        path.unlink()
 
 def main():
     parser = argparse.ArgumentParser()
