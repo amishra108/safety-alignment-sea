@@ -1,3 +1,0 @@
-Directory: salmonn2_trained
-Purpose: SALMONN-2 evaluation model and SEA-trained checkpoints.
-Pretrained weights and trained checkpoints are stored locally and excluded from GitHub.

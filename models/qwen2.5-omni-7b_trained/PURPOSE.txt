@@ -1,3 +1,0 @@
-Directory: qwen2.5-omni-7b_trained
-Purpose: Qwen2.5-Omni evaluation model and SEA-trained checkpoints.
-Pretrained weights and trained checkpoints are stored locally and excluded from GitHub.
