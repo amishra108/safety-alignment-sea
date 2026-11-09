@@ -129,7 +129,7 @@ def train(cfg, work_root, on_epoch_end=None):
         if harmful is None:
             raise ValueError('Preflight requires a harmful example')
         indices = [harmful]
-    if any(rows[i]['category'] == 'harmful' for i in indices):
+    if cfg.get('training_modality') != 'text_only' and any(rows[i]['category'] == 'harmful' for i in indices):
         missing = [i for i in indices if rows[i]['category'] == 'harmful' and not (Path(cfg['embedding_dir']) / f'row_{i:04d}.pt').is_file()]
         if missing:
             raise FileNotFoundError(f'Missing {len(missing)} embedding(s), first index: {missing[0]}')

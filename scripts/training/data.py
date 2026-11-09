@@ -38,6 +38,8 @@ def embedding_for(cfg, index, model):
 
 def training_sample(rows, index, cfg):
     row = rows[index]
+    if cfg.get("training_modality") == "text_only":
+        return row["prompt"], None, False
     if row['category'] == 'harmful':
         prefix = cfg['instruction_prefix_' + row['phrase_type']]
         return prefix + row['rewritten_prompt'].strip(), embedding_for(cfg, index, cfg['model']), True

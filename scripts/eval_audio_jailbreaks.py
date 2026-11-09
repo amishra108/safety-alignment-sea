@@ -114,8 +114,6 @@ def parse_args():
 
     args = p.parse_args()
 
-    if args.model == "video4b" and args.modality != "audio":
-        p.error("Video4B evaluation supports audio only")
     if args.num_shards < 1 or not 0 <= args.shard_id < args.num_shards:
         p.error("Invalid shard configuration")
     if args.max_new_tokens < 1 or (args.limit is not None and args.limit < 1):
@@ -500,7 +498,31 @@ def qwen_generate(adapter, args, row, modality):
     )[0].strip()
 
 
-def video_generate(adapter, args, row):
+def video_generate(adapter, args, row, modality):
+    if modality == "text":
+        prompt = adapter.tokenizer.apply_chat_template(
+            [{"role": "user", "content": row["prompt_text"]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        tokens = adapter.tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).to(adapter.device)
+        with torch.inference_mode():
+            result = adapter.model.generate(
+                **tokens,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+            )
+        return adapter.tokenizer.decode(
+            result[0, tokens["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+
     import copy
     import librosa
 
@@ -697,7 +719,7 @@ def main():
                 "penalty_alpha": None,
             },
             "decoding": "greedy",
-            "instruction": args.video_instruction,
+            "instruction": args.video_instruction if args.modality != "text" else None,
             "audio_sample_rate": 16000,
             "audio_chunk_seconds": 30,
             "audio_tokens_per_chunk": 60,
@@ -810,7 +832,7 @@ def main():
                 response = (
                     qwen_generate(adapter, args, row, modality)
                     if args.model == "qwen25_omni"
-                    else video_generate(adapter, args, row)
+                    else video_generate(adapter, args, row, modality)
                 )
 
                 record = {
@@ -824,14 +846,14 @@ def main():
                     "modality": modality,
                     "model_input_mode": (
                         "audio_plus_fixed_instruction"
-                        if args.model == "video4b" and args.video_instruction
+                        if modality == "audio" and args.model == "video4b" and args.video_instruction
                         else "audio_only"
                         if modality == "audio"
                         else "text_only"
                     ),
                     "target_extra_instruction": (
                         args.video_instruction
-                        if args.model == "video4b"
+                        if args.model == "video4b" and modality == "audio"
                         else None
                     ),
                     "generation": generation,
