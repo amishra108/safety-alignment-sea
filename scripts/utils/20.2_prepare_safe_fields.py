@@ -16,7 +16,7 @@ SOURCE = (
 )
 MODEL = ROOT / "models/qwen3-4b"
 WORK = ROOT / "outputs/utils_and_prev_evals/20.2_prepare_safe_fields"
-VERSION = "benign-audio-fields-v1"
+VERSION = "benign-audio-fields-v2"
 
 ORIGINAL_PREPARED = ROOT / "data/saferlhf/sea_3000_prepared.jsonl"
 
@@ -72,8 +72,9 @@ TASK 3: CREATE A VAGUE QUESTION
 
 Write a short generic question preserving the broad assistance requested, but hiding the identifying details of the benign activity or product.
 
-For activities, use "this activity".
-For products, use "this product" or "these products".
+Use a natural vague reference to the hidden subject.
+Examples include "this", "this activity", "this process", "this task",
+"this product", or another grammatically natural vague reference.
 
 Examples:
 "How can I perform this activity?"
@@ -87,9 +88,11 @@ TASK 4: CREATE A CLEANED INSTRUCTION
 
 Rewrite the original instruction while preserving its wording, context, structure, and question as closely as possible.
 
-Replace the main benign activity with the exact words "this activity", or the product with "this product".
+Replace or abstract the main benign activity or product with a natural vague reference.
 
-Use grammatical constructions such as "perform this activity" when necessary.
+Preserve the original grammar and wording as closely as possible.
+Do not force the phrases "this activity" or "this product" when another
+construction is more natural.
 
 Make the smallest reasonable change. Do not rewrite the entire instruction into a generic question. Do not add warnings, refusals, answers, or commentary.
 
@@ -109,6 +112,51 @@ OUTPUT EXACTLY THESE SECTIONS:
 
 [Instruction]
 {instruction}
+"""
+
+REPAIR_EXTRACTION_PROMPT = """You are repairing one BENIGN training example.
+
+Original benign instruction:
+{instruction}
+
+Return exactly one JSON object and nothing else, with these four string fields:
+
+"benign_phrase":
+A self-contained phrase describing the principal benign activity or product.
+
+"phrase_type":
+Exactly "activity" or "product".
+
+"rewritten_prompt":
+A minimally abstracted version of the ORIGINAL instruction.
+Preserve its wording, context, structure, modifiers, and question as closely as possible.
+Abstract the principal benign activity or product using a natural vague reference.
+Make only the smallest grammatical changes needed.
+Do NOT turn this into a generic question.
+
+"vague_rewritten_prompt":
+A short generic question hiding the identifying details.
+Use any grammatically natural vague reference.
+
+Do not add markdown or commentary.
+"""
+
+REPAIR_COMPLETION_PROMPT = """You are repairing one BENIGN training example.
+
+Benign activity phrase:
+{phrase}
+
+Return exactly one JSON object and nothing else with:
+
+"extended_sentence":
+One natural complete third-person sentence describing a person performing the activity.
+It should normally begin with "a person is".
+Preserve the activity's objects, purpose, participants, and relevant context.
+
+"rephrased_phrase":
+The corresponding activity phrase as it appears in the sentence.
+
+Do not add instructions, warnings, markdown, or commentary.
 """
 
 COMPLETION_PROMPT = """Convert the benign activity phrase into a natural, complete, third-person sentence describing someone performing that activity.
@@ -148,11 +196,11 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=512)
     args = parser.parse_args()
 
-    if args.num_shards != 5:
-        parser.error("This run uses exactly five shards.")
+    if args.num_shards < 1:
+        parser.error("--num-shards must be positive")
 
-    if args.shard_id not in range(5):
-        parser.error("--shard-id must be 0-4.")
+    if not 0 <= args.shard_id < args.num_shards:
+        parser.error("Invalid shard ID")
 
     return args
 
@@ -278,6 +326,70 @@ def stage_path(folder, index, stage):
     return folder / f"row_{index:04d}_{stage}.json"
 
 
+def write_prompt_txt(folder):
+    records = []
+
+    for path in folder.glob("row_*_complete.json"):
+        saved = json.loads(path.read_text(encoding="utf-8"))
+
+        if saved.get("stage") != "complete":
+            continue
+
+        value = saved.get("value")
+        if not isinstance(value, dict):
+            continue
+
+        index = value.get("index")
+        if not isinstance(index, int):
+            continue
+
+        records.append((index, value))
+
+    records.sort(key=lambda item: item[0])
+
+    output = folder / "all_prompts.txt"
+    temporary = output.with_name(output.name + ".tmp")
+
+    with temporary.open("w", encoding="utf-8") as f:
+        for index, row in records:
+            f.write(f"INDEX: {index}\n")
+            f.write(f"ORIGINAL_HARMFUL: {row.get('prompt', '')}\n")
+            f.write(f"BENIGN_PROMPT: {row.get('safe_prompt', '')}\n")
+            f.write(f"SAFE_RESPONSE: {row.get('safe_response', '')}\n")
+            f.write(
+                "OVER_REFUSAL_RESPONSE: "
+                f"{row.get('over_refusal_response', '')}\n"
+            )
+            f.write(f"PHRASE_TYPE: {row.get('phrase_type', '')}\n")
+            f.write(f"PHRASE: {row.get('benign_phrase', '')}\n")
+            f.write(
+                f"REWRITTEN: {row.get('rewritten_prompt', '')}\n"
+            )
+            f.write(
+                "VAGUE: "
+                f"{row.get('vague_rewritten_prompt', '')}\n"
+            )
+            f.write(
+                "AUDIO_CONTENT: "
+                f"{row.get('audio_content_control_target', '')}\n"
+            )
+            f.write(
+                "AUDIO_STYLE: "
+                f"{row.get('audio_style_control_target', '')}\n"
+            )
+            f.write("\n")
+
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(temporary, output)
+
+    print(
+        f"Prompt TXT refreshed: {len(records)} rows -> {output}",
+        flush=True,
+    )
+
+
 def stage(folder, index, name, source_hash, produce):
     path = stage_path(folder, index, name)
 
@@ -305,57 +417,140 @@ def process(index, row, folder, model, tokenizer, max_tokens, style_target):
     source_hash = fingerprint(index, row)
 
     def extract():
-        raw = generate(
-            model,
-            tokenizer,
-            EXTRACTION_PROMPT.format(instruction=row["safe_prompt"]),
-            max_tokens,
-        )
-
-        fields = parse_sections(
-            raw,
-            [
-                "Key Phrase",
-                "Phrase Type",
-                "Rephrased Question",
-                "Cleaned Instruction",
-            ],
-        )
-
-        phrase_type = fields["Phrase Type"].lower().strip()
-        if phrase_type not in {"activity", "product"}:
-            raise ValueError(f"Invalid phrase type: {phrase_type}")
-
-        marker = (
-            "this activity"
-            if phrase_type == "activity"
-            else "this product"
-        )
-
-        vague = fields["Rephrased Question"]
-        cleaned = fields["Cleaned Instruction"]
-
-        if phrase_type == "activity":
-            if "this activity" not in vague.lower():
-                raise ValueError("Vague question missing 'this activity'")
-        else:
-            if not any(
-                phrase in vague.lower()
-                for phrase in ("this product", "these products")
-            ):
-                raise ValueError("Vague question missing product placeholder")
-
-        if marker not in cleaned.lower():
-            raise ValueError(
-                f"Cleaned instruction missing '{marker}'"
+        def validate_result(result):
+            required = (
+                "benign_phrase",
+                "phrase_type",
+                "rewritten_prompt",
+                "vague_rewritten_prompt",
             )
 
-        return {
-            "benign_phrase": fields["Key Phrase"],
-            "phrase_type": phrase_type,
-            "rewritten_prompt": vague,
-            "cleaned_rewritten_prompt": cleaned,
-        }
+            for field in required:
+                value = result.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Missing extraction field: {field}")
+                result[field] = value.strip()
+
+            phrase_type = result["phrase_type"].lower()
+            result["phrase_type"] = phrase_type
+
+            if phrase_type not in {"activity", "product"}:
+                raise ValueError(
+                    f"Invalid phrase type: {result['phrase_type']!r}"
+                )
+
+            rewritten = result["rewritten_prompt"].lower()
+            vague = result["vague_rewritten_prompt"].lower()
+
+            if phrase_type == "activity":
+                if "this activity" not in rewritten:
+                    raise ValueError(
+                        "Rewritten prompt missing 'this activity'"
+                    )
+                if "this activity" not in vague:
+                    raise ValueError(
+                        "Vague prompt missing 'this activity'"
+                    )
+            else:
+                if "this product" not in rewritten:
+                    raise ValueError(
+                        "Rewritten prompt missing 'this product'"
+                    )
+                if not any(
+                    marker in vague
+                    for marker in ("this product", "these products")
+                ):
+                    raise ValueError(
+                        "Vague prompt missing product placeholder"
+                    )
+
+            result["cleaned_rewritten_prompt"] = (
+                result["rewritten_prompt"]
+            )
+
+            return result
+
+        # First try the original generation format
+        try:
+            raw = generate(
+                model,
+                tokenizer,
+                EXTRACTION_PROMPT.format(
+                    instruction=row["safe_prompt"]
+                ),
+                max_tokens,
+            )
+
+            fields = parse_sections(
+                raw,
+                [
+                    "Key Phrase",
+                    "Phrase Type",
+                    "Rephrased Question",
+                    "Cleaned Instruction",
+                ],
+            )
+
+            return validate_result({
+                "benign_phrase": fields["Key Phrase"],
+                "phrase_type": fields["Phrase Type"],
+                "rewritten_prompt": fields["Cleaned Instruction"],
+                "vague_rewritten_prompt":
+                    fields["Rephrased Question"],
+            })
+
+        except Exception as first_error:
+            print(
+                f"  Original extraction failed: "
+                f"{type(first_error).__name__}: {first_error}",
+                flush=True,
+            )
+
+        # Failed rows use a stricter JSON repair prompt
+        last_error = None
+
+        for attempt in range(1, 6):
+            try:
+                raw = generate(
+                    model,
+                    tokenizer,
+                    REPAIR_EXTRACTION_PROMPT.format(
+                        instruction=row["safe_prompt"]
+                    ),
+                    max_tokens,
+                )
+
+                start_json = raw.find("{")
+                if start_json < 0:
+                    raise ValueError("Repair output has no JSON object")
+
+                decoder = json.JSONDecoder()
+                value, _ = decoder.raw_decode(raw[start_json:])
+
+                if not isinstance(value, dict):
+                    raise ValueError("Repair output is not a JSON object")
+
+                result = validate_result(value)
+
+                print(
+                    f"  Extraction repaired on attempt {attempt}",
+                    flush=True,
+                )
+
+                return result
+
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"  Repair extraction attempt {attempt}/5 failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        raise RuntimeError(
+            "Extraction repair failed after 5 attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        )
 
     extraction = stage(
         folder, index, "extraction", source_hash, extract
@@ -363,35 +558,105 @@ def process(index, row, folder, model, tokenizer, max_tokens, style_target):
 
     if extraction["phrase_type"] == "activity":
         def complete():
-            raw = generate(
-                model,
-                tokenizer,
-                COMPLETION_PROMPT.format(
-                    phrase=extraction["benign_phrase"]
-                ),
-                max_tokens,
+            def validate_completion(result):
+                extended = result.get("extended_sentence")
+                rephrased = result.get("rephrased_phrase")
+
+                if not isinstance(extended, str) or not extended.strip():
+                    raise ValueError("Missing extended_sentence")
+
+                if not isinstance(rephrased, str) or not rephrased.strip():
+                    raise ValueError("Missing rephrased_phrase")
+
+                extended = " ".join(extended.split())
+                rephrased = " ".join(rephrased.split())
+
+                if len(extended.split()) < 4:
+                    raise ValueError("Extended sentence too short")
+
+                return {
+                    "extended_sentence": extended,
+                    "rephrased_phrase": rephrased,
+                }
+
+            # First preserve the original completion behaviour
+            try:
+                raw = generate(
+                    model,
+                    tokenizer,
+                    COMPLETION_PROMPT.format(
+                        phrase=extraction["benign_phrase"]
+                    ),
+                    max_tokens,
+                )
+
+                fields = parse_sections(
+                    raw,
+                    ["Extended sentences", "Rephrased Phrase"],
+                )
+
+                return validate_completion({
+                    "extended_sentence":
+                        fields["Extended sentences"],
+                    "rephrased_phrase":
+                        fields["Rephrased Phrase"],
+                })
+
+            except Exception as first_error:
+                print(
+                    f"  Original completion failed: "
+                    f"{type(first_error).__name__}: {first_error}",
+                    flush=True,
+                )
+
+            last_error = None
+
+            for attempt in range(1, 6):
+                try:
+                    raw = generate(
+                        model,
+                        tokenizer,
+                        REPAIR_COMPLETION_PROMPT.format(
+                            phrase=extraction["benign_phrase"]
+                        ),
+                        max_tokens,
+                    )
+
+                    start_json = raw.find("{")
+                    if start_json < 0:
+                        raise ValueError(
+                            "Completion repair has no JSON object"
+                        )
+
+                    decoder = json.JSONDecoder()
+                    value, _ = decoder.raw_decode(raw[start_json:])
+
+                    if not isinstance(value, dict):
+                        raise ValueError(
+                            "Completion repair is not a JSON object"
+                        )
+
+                    result = validate_completion(value)
+
+                    print(
+                        f"  Completion repaired on attempt {attempt}",
+                        flush=True,
+                    )
+
+                    return result
+
+                except Exception as exc:
+                    last_error = exc
+                    print(
+                        f"  Repair completion attempt {attempt}/5 failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
+            raise RuntimeError(
+                "Completion repair failed after 5 attempts: "
+                f"{type(last_error).__name__}: {last_error}"
             )
-
-            fields = parse_sections(
-                raw,
-                ["Extended sentences", "Rephrased Phrase"],
-            )
-
-            extended = " ".join(
-                fields["Extended sentences"].split()
-            )
-
-            rephrased = " ".join(
-                fields["Rephrased Phrase"].split()
-            )
-
-            if len(extended.split()) < 4:
-                raise ValueError("Extended sentence too short")
-
-            return {
-                "extended_sentence": extended,
-                "rephrased_phrase": rephrased,
-            }
 
         completion = stage(
             folder, index, "completion", source_hash, complete
@@ -420,7 +685,7 @@ def process(index, row, folder, model, tokenizer, max_tokens, style_target):
             "The audio contains an activity. "
             if extraction["phrase_type"] == "activity"
             else "The audio contains a product. "
-        ) + extraction["rewritten_prompt"],
+        ) + extraction["vague_rewritten_prompt"],
         "preparation_version": VERSION,
     }
 
@@ -441,12 +706,14 @@ def main():
     original_styles = load_original_styles(rows)
 
     folder = (
-        WORK / "num_shards_5"
+        WORK / f"num_shards_{args.num_shards}_v2"
         / f"shard_{args.shard_id:02d}"
     )
     folder.mkdir(parents=True, exist_ok=True)
 
-    indices = list(range(args.shard_id, 2000, 5))
+    indices = list(range(args.shard_id, 2000, args.num_shards))
+    write_prompt_txt(folder)
+
     pending = []
 
     for index in indices:
@@ -463,7 +730,7 @@ def main():
             pending.append(index)
 
     print(
-        f"Shard {args.shard_id}/5: "
+        f"Shard {args.shard_id}/{args.num_shards}: "
         f"assigned={len(indices)} "
         f"completed={len(indices) - len(pending)} "
         f"pending={len(pending)}",
@@ -524,17 +791,19 @@ def main():
                 flush=True,
             )
             print(
-                f"  VAGUE: {prepared['rewritten_prompt']}",
+                f"  REWRITTEN: {prepared['rewritten_prompt']}",
                 flush=True,
             )
             print(
-                f"  CLEANED: {prepared['cleaned_rewritten_prompt']}",
+                f"  VAGUE: {prepared['vague_rewritten_prompt']}",
                 flush=True,
             )
             print(
                 f"  AUDIO: {prepared['audio_content_control_target']}",
                 flush=True,
             )
+
+            write_prompt_txt(folder)
 
             error_path = stage_path(folder, index, "error")
             if error_path.exists():
@@ -568,6 +837,119 @@ def main():
             f"{len(failures)} rows incomplete; rerun this shard "
             "to retry them."
         )
+
+    # A one-shard run can now produce the final merged dataset
+    if args.num_shards == 1 and args.shard_id == 0:
+        merged = []
+
+        for index in range(2000):
+            complete_path = stage_path(
+                folder, index, "complete"
+            )
+
+            if not complete_path.exists():
+                raise RuntimeError(
+                    f"Cannot merge: row {index} is incomplete"
+                )
+
+            saved = json.loads(
+                complete_path.read_text(encoding="utf-8")
+            )
+
+            if saved.get("stage") != "complete":
+                raise RuntimeError(
+                    f"Invalid complete checkpoint at row {index}"
+                )
+
+            if saved.get("source_hash") != fingerprint(
+                index, rows[index]
+            ):
+                raise RuntimeError(
+                    f"Source hash mismatch at row {index}"
+                )
+
+            record = saved["value"]
+
+            if record.get("index") != index:
+                raise RuntimeError(
+                    f"Merged index mismatch at row {index}"
+                )
+
+            if record.get("prompt") != rows[index]["prompt"]:
+                raise RuntimeError(
+                    f"Original prompt mismatch at row {index}"
+                )
+
+            if record.get("safe_prompt") != rows[index]["safe_prompt"]:
+                raise RuntimeError(
+                    f"Safe prompt mismatch at row {index}"
+                )
+
+            if (
+                record.get("audio_style_control_target")
+                != original_styles[index]
+            ):
+                raise RuntimeError(
+                    f"Original audio style mismatch at row {index}"
+                )
+
+            phrase_type = record.get("phrase_type")
+            rewritten = record.get(
+                "rewritten_prompt", ""
+            ).lower()
+
+            if phrase_type == "activity":
+                if "this activity" not in rewritten:
+                    raise RuntimeError(
+                        f"Missing activity placeholder at row {index}"
+                    )
+            elif phrase_type == "product":
+                if "this product" not in rewritten:
+                    raise RuntimeError(
+                        f"Missing product placeholder at row {index}"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Invalid phrase type at row {index}"
+                )
+
+            merged.append(record)
+
+        final_path = (
+            WORK
+            / "sea_2000_benign_overrefusal_prepared.jsonl"
+        )
+
+        fd, temporary = tempfile.mkstemp(
+            prefix=".sea_2000_",
+            suffix=".jsonl",
+            dir=str(WORK),
+        )
+
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for record in merged:
+                    json.dump(
+                        record,
+                        f,
+                        ensure_ascii=False,
+                    )
+                    f.write("\n")
+
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temporary, final_path)
+
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+        print(
+            f"MERGED: {len(merged)} rows -> {final_path}",
+            flush=True,
+        )
+
 
 
 if __name__ == "__main__":
