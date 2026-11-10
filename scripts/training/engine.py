@@ -304,19 +304,27 @@ def train(cfg, work_root, on_epoch_end=None):
                 write_json(work_root / 'preflight.json', {'passed': True, 'metrics': metrics, 'step': state['global_step']})
                 print(f'PREFLIGHT PASSED: {work_root / "preflight.json"}', flush=True)
                 return
-            if cfg['save_every_steps'] and state['global_step'] % cfg['save_every_steps'] == 0:
+            if (not cfg.get('final_only_checkpoint', False) and cfg['save_every_steps'] and state['global_step'] % cfg['save_every_steps'] == 0):
                 manager.save_resume(adapter.model, optimizer, state)
             if cfg['max_steps'] and state['global_step'] >= cfg['max_steps']:
-                manager.save_resume(adapter.model, optimizer, state)
-                print('Reached --max-steps; training is resumable', flush=True)
+                if not cfg.get('final_only_checkpoint', False):
+                    manager.save_resume(adapter.model, optimizer, state)
+                    print('Reached --max-steps; training is resumable', flush=True)
+                else:
+                    print('Reached --max-steps; no checkpoint saved', flush=True)
                 return
         append(work_root / 'metrics.jsonl', {'type': 'epoch', 'epoch': epoch,
                                              'mean_loss': statistics.fmean(losses) if losses else None,
                                              'global_step': state['global_step']})
-        if not (work_root / 'checkpoints' / f'epoch_{epoch:03d}').exists():
+        save_epoch = (
+            not cfg.get('final_only_checkpoint', False)
+            or epoch == cfg['epochs']
+        )
+        if save_epoch:
             manager.save_epoch(adapter.model, epoch)
         next_state = {'epoch': epoch + 1, 'position': 0, 'global_step': state['global_step']}
-        manager.save_resume(adapter.model, optimizer, next_state)
+        if not cfg.get('final_only_checkpoint', False):
+            manager.save_resume(adapter.model, optimizer, next_state)
         state = next_state
         if on_epoch_end is not None:
             on_epoch_end(adapter, epoch, work_root)
