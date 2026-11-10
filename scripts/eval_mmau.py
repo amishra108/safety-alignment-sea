@@ -22,6 +22,7 @@ from scripts.eval_audio_jailbreaks import (
     load_model,
     read_jsonl,
     resolve_checkpoint,
+    reject_workshare,
 )
 from scripts.eval_va_safetybench import qwen_infer, video_infer
 
@@ -661,6 +662,7 @@ def main():
     with directory_lock(
         jsonl.parent / f"{stem}.lock"
     ):
+        reject_workshare(jsonl.parent, stem)
         existing = read_jsonl(
             jsonl,
             repair=True,

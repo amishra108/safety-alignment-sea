@@ -67,6 +67,15 @@ def directory_lock(path):
         lock_dir.rmdir()
 
 
+def reject_workshare(shard_dir, stem):
+    marker = shard_dir / f".workshare.{stem}.json"
+    if marker.exists():
+        raise RuntimeError(
+            f"Shard {stem} is owned by work-sharing: {marker}. "
+            "Use eval_workshare.py to complete it."
+        )
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Evaluate base and trained checkpoints on audio jailbreaks"
@@ -759,6 +768,7 @@ def main():
     txt = shard_dir / f"responses.{stem}.txt"
 
     with directory_lock(shard_dir / f"{stem}.lock"):
+        reject_workshare(shard_dir, stem)
 
         start = len(rows) * args.shard_id // args.num_shards
         end = len(rows) * (args.shard_id + 1) // args.num_shards

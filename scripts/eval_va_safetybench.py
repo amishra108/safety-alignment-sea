@@ -21,6 +21,7 @@ from scripts.eval_audio_jailbreaks import (
     load_model,
     read_jsonl,
     resolve_checkpoint,
+    reject_workshare,
 )
 
 CONDITIONS = ("Text_only", "Audio_only", "KPT", "KPT_noise")
@@ -498,6 +499,7 @@ def main():
     txt = shard_dir / f"responses.{stem}.txt"
 
     with directory_lock(shard_dir / f"{stem}.lock"):
+        reject_workshare(shard_dir, stem)
 
         start = len(rows) * args.shard_id // args.num_shards
         end = len(rows) * (args.shard_id + 1) // args.num_shards
